@@ -1,0 +1,25 @@
+# Harness comparison: the same small coding and documentation tasks, each in a fresh temp git
+# repo, checked by a script (tests, planted-bug detection, required content). Run through run.sh:
+#   bash run.sh --harnesses claude,codex -n 2
+# Providers are the ids in harnesses.conf (or harnesses.conf.example). Tasks use synthetic code only.
+name: harness-comparison
+description: Bug fix, test writing with planted-bug check, rename refactoring, README usage docs, COBOL explanation.
+repetitions: 1
+timeout: 900
+
+providers:
+  - {id: fake-good, type: shell, command: "{python} harness_run.py --harness fake-good"}
+  - {id: fake-noop, type: shell, default: false, command: "{python} harness_run.py --harness fake-noop"}
+  - {id: claude, type: shell, default: false, command: "{python} harness_run.py --harness claude"}
+  - {id: codex, type: shell, default: false, command: "{python} harness_run.py --harness codex"}
+  - {id: opencode, type: shell, default: false, command: "{python} harness_run.py --harness opencode"}
+  - {id: copilot, type: shell, default: false, command: "{python} harness_run.py --harness copilot"}
+  - {id: aider, type: shell, default: false, command: "{python} harness_run.py --harness aider"}
+  - {id: gemini, type: shell, default: false, command: "{python} harness_run.py --harness gemini"}
+
+cases:
+  - {id: fix-bug, input: fix-bug, graders: [{type: regex, pattern: '"check": "pass"'}]}
+  - {id: add-tests, input: add-tests, graders: [{type: regex, pattern: '"check": "pass"'}]}
+  - {id: rename, input: rename, graders: [{type: regex, pattern: '"check": "pass"'}]}
+  - {id: doc-readme, input: doc-readme, graders: [{type: regex, pattern: '"check": "pass"'}]}
+  - {id: legacy-explain, input: legacy-explain, graders: [{type: regex, pattern: '"check": "pass"'}]}

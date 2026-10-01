@@ -1,0 +1,8 @@
+{
+  "name": "work-kit-gemini-cli",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@google/gemini-cli": "0.61.0"
+  }
+}

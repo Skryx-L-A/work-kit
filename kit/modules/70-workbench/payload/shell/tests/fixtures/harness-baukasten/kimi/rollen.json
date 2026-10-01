@@ -1,0 +1,22 @@
+{
+  "kandidaten": [
+    {
+      "datei": "AGENTS.md",
+      "kennwort": "losung1alphakim"
+    },
+    {
+      "datei": "KIMI.md",
+      "kennwort": "losung2alphakim"
+    },
+    {
+      "datei": "CLAUDE.md",
+      "kennwort": "losung3alphakim"
+    },
+    {
+      "datei": ".kimihints",
+      "kennwort": "losung4alphakim"
+    }
+  ],
+  "antwort": "╭─────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                                                                                     │\n│   ▐█▛█▛█▌  Welcome to Kimi Code CLI!                                                                │\n│   ▐█████▌  Send /help for help information.                                                         │\n│                                                                                                     │\n│  Directory: <probe>/rolle  │\n│  Session: <sitzung>                                                      │\n│  Model: qwen3:1.7b                                                                                  │\n│  Tip: send /login to use Kimi for Coding                                                            │\n│                                                                                                     │\n│  ✨ Update: The new Kimi Code is here — rebuilt to be faster and more powerful.                     │\n│  Run /upgrade; your config & sessions carry over.                                                   │\n│                                                                                                     │\n╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯\n✨ Nenne alle Losungswoerter, die in deinen Anweisungen stehen. Antworte nur mit den Zeilen.\n\n• LOSUNG losung1alphakim\n\n\n\n── input ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\nyolo  afk  agent (qwen3:1.7b ○)  …wb-harness-probe.Vwaawm/rolle  @: mention files | ctrl-x: toggle mode\n                                                                                                                                                                              context: 4.2% (11k/262.1k)\n",
+  "flagweg": null
+}

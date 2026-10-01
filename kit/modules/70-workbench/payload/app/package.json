@@ -1,0 +1,10 @@
+{
+  "name": "agent-workbench",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Fenster fuer tmux-Sessions ueber den Steuermodus, mit Steuerkanal",
+  "main": "dist/main/main.js",
+  "dependencies": {
+    "node-pty": "1.2.0-beta.14"
+  }
+}

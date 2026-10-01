@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test stub of dconf: flat file database $FAKE_DB ("path=value" lines), locks in $FAKE_LOCKS.
+set -eu
+db="${FAKE_DB:?}"; locks="${FAKE_LOCKS:-/dev/null}"; touch "$db"
+get() { awk -v k="$1=" 'index($0,k)==1 {print substr($0,length(k)+1); exit}' "$db"; }
+del() { awk -v k="$1=" 'index($0,k)!=1' "$db" >"$db.tmp"; mv "$db.tmp" "$db"; }
+case "$1" in
+  read) get "$2" ;;
+  write) if grep -qxF "$2" "$locks" 2>/dev/null; then echo "error: The operation attempted to modify one or more non-writable keys" >&2; exit 1; fi
+         del "$2"; printf '%s=%s\n' "$2" "$3" >>"$db" ;;
+  reset) if [ "$2" = -f ]; then awk -v k="$3" 'index($0,k)!=1' "$db" >"$db.tmp"; mv "$db.tmp" "$db"; else del "$2"; fi ;;
+  dump) cp "$db" /dev/stdout ;;
+  load) while IFS= read -r l; do k="${l%%=*}"; del "$k"; printf '%s\n' "$l" >>"$db"; done ;;
+  list) awk -v k="$2" 'index($0,k)==1 {print substr($0,length(k)+1)}' "$db" | cut -d/ -f1 | grep -v = | sort -u | sed 's|$|/|' ;;
+  *) echo "stub dconf: unsupported $*" >&2; exit 2 ;;
+esac

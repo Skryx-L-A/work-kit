@@ -1,0 +1,93 @@
+# Omarchy 4.0 default bindings (default/hypr/bindings/*.lua, read 2026-09-25) mapped to GNOME.
+# Format: omarchy key | action | kind:target
+#   set:<dconf path>       accelerator is added to that GNOME keybinding list
+#   custom:<command>       GNOME custom shortcut; @BIN@ = the kit bin dir
+#   tiler:<dconf path>     Tiling Shell keybinding (only when Tiling Shell or the kit tiler is active; the kit
+#                          tiler, kit-tiling, uses the same key names in its own schema)
+#   kit:<dconf path>       kit tiler keybinding (only when the kit tiler is active)
+#   clip:<dconf path>      Clipboard Indicator keybinding (only when that extension is enabled)
+#   gnome:<note>           GNOME already does this with its default binding (listed for Super+K)
+#   super:<note>           Super alone; listed only when installed with --skip superkey (default: does nothing)
+#   none:<reason>          not available on GNOME
+# "DIGIT" in a key expands to workspaces 1..9 and 0 (= 10), limited to the configured count.
+# Keyboard layouts: GNOME binds a key symbol to the first key that has it, unshifted level first.
+# PLUS is the "+" key on German QWERTZ and the "=" key (its shifted "+") on US: one binding, the
+# same place as Omarchy's Super+= on both. EQUAL would be Super+0 on German QWERTZ (the "=" is
+# Shift+0 there), so it is not used. `kit-desk keys` names the key of the active layout.
+SUPER + RETURN|Terminal|custom:@BIN@/kit-desk term
+SUPER + ALT + RETURN|Terminal with tmux|custom:@BIN@/kit-desk term --tmux
+SUPER + SHIFT + RETURN|Browser|custom:@BIN@/kit-desk browser
+SUPER + SHIFT + B|Browser|custom:@BIN@/kit-desk browser
+SUPER + SHIFT + ALT + B|Browser (private)|custom:@BIN@/kit-desk browser --private
+SUPER + SHIFT + F|File manager|custom:@BIN@/kit-desk files
+SUPER + SHIFT + N|Editor (nvim)|custom:@BIN@/kit-desk editor
+SUPER + CTRL + T|Activity (btop)|custom:@BIN@/kit-desk term -e btop
+SUPER + K|Show keybindings|custom:@BIN@/kit-desk keys --window
+SUPER + SHIFT + CTRL + SPACE|Theme menu|custom:@BIN@/kit-desk term -e @BIN@/kit-desk theme
+SUPER + ESCAPE|System menu: lock, log out, power off|custom:@BIN@/kit-desk power
+SUPER + SPACE|Launcher: type to search apps, Enter opens|set:/org/gnome/shell/keybindings/toggle-overview
+SUPER + ALT + SPACE|Kit menu: settings, keys, theme, system|custom:@BIN@/kit-desk menu
+SUPER + A|App grid (GNOME key, kept)|gnome:toggle-application-view
+SUPER|Overview: windows, workspaces, search|super:overlay-key
+ALT + F2|Run a command|gnome:panel-run-dialog
+SUPER + CTRL + L|Lock screen|set:/org/gnome/settings-daemon/plugins/media-keys/screensaver
+CTRL + ALT + DELETE|Log out dialog|gnome:logout
+SUPER + W|Close window (Alt+F4 also closes)|set:/org/gnome/desktop/wm/keybindings/close
+SUPER + H|Hide window (back with Alt+Tab)|gnome:minimize
+SUPER + F|Full screen|set:/org/gnome/desktop/wm/keybindings/toggle-fullscreen
+SUPER + ALT + F|Full width (maximize)|set:/org/gnome/desktop/wm/keybindings/toggle-maximized
+SUPER + O|Pop window out (keep on top)|set:/org/gnome/desktop/wm/keybindings/toggle-above
+SUPER + T|Float window (Super+Shift+arrow tiles it again)|tiler:/org/gnome/shell/extensions/tilingshell/untile-window
+SUPER + LEFT|Focus left|tiler:/org/gnome/shell/extensions/tilingshell/focus-window-left
+SUPER + RIGHT|Focus right|tiler:/org/gnome/shell/extensions/tilingshell/focus-window-right
+SUPER + UP|Focus up|tiler:/org/gnome/shell/extensions/tilingshell/focus-window-up
+SUPER + DOWN|Focus down|tiler:/org/gnome/shell/extensions/tilingshell/focus-window-down
+SUPER + SHIFT + LEFT|Swap window left|tiler:/org/gnome/shell/extensions/tilingshell/move-window-left
+SUPER + SHIFT + RIGHT|Swap window right|tiler:/org/gnome/shell/extensions/tilingshell/move-window-right
+SUPER + SHIFT + UP|Swap window up|tiler:/org/gnome/shell/extensions/tilingshell/move-window-up
+SUPER + SHIFT + DOWN|Swap window down|tiler:/org/gnome/shell/extensions/tilingshell/move-window-down
+SUPER + L|Next tiling layout|tiler:/org/gnome/shell/extensions/tilingshell/cycle-layouts
+SUPER + CTRL + F|Tiled full screen (window spans all tiles)|tiler:/org/gnome/shell/extensions/tilingshell/span-window-all-tiles
+SUPER + DIGIT|Switch to workspace DIGIT|set:/org/gnome/desktop/wm/keybindings/switch-to-workspace-DIGIT
+SUPER + SHIFT + DIGIT|Move window to workspace DIGIT|set:/org/gnome/desktop/wm/keybindings/move-to-workspace-DIGIT
+SUPER + SHIFT + ALT + DIGIT|Move window silently to workspace DIGIT|none:GNOME always follows the window
+SUPER + TAB|Next workspace|set:/org/gnome/desktop/wm/keybindings/switch-to-workspace-right
+SUPER + SHIFT + TAB|Previous workspace|set:/org/gnome/desktop/wm/keybindings/switch-to-workspace-left
+SUPER + CTRL + TAB|Former workspace|none:GNOME has no back-and-forth binding
+ALT + TAB|Next window|set:/org/gnome/desktop/wm/keybindings/switch-windows
+ALT + SHIFT + TAB|Previous window|set:/org/gnome/desktop/wm/keybindings/switch-windows-backward
+SUPER + ALT + TAB|Next window in group|set:/org/gnome/desktop/wm/keybindings/switch-group
+SUPER + ALT + SHIFT + TAB|Previous window in group|set:/org/gnome/desktop/wm/keybindings/switch-group-backward
+SUPER + mouse drag|Move / resize window (left / right button)|gnome:mouse-button-modifier <Super>, resize-with-right-button true
+PRINT|Screenshot (area, window, screen)|gnome:show-screenshot-ui
+SHIFT + PRINT|Screenshot of the whole screen|gnome:screenshot
+ALT + PRINT|Screen recording|set:/org/gnome/shell/keybindings/show-screen-recording-ui
+XF86 media keys|Volume, brightness, media|gnome:media keys work as before
+SUPER + S|Quick settings (sound, network, power, dark mode)|gnome:toggle-quick-settings
+SUPER + P|Display mode (mirror, extend)|gnome:switch-monitor
+SUPER + SHIFT + ALT + LEFT|Move window to the monitor on the left|set:/org/gnome/desktop/wm/keybindings/move-to-monitor-left
+SUPER + SHIFT + ALT + RIGHT|Move window to the monitor on the right|set:/org/gnome/desktop/wm/keybindings/move-to-monitor-right
+SUPER + SHIFT + ALT + UP|Move window to the monitor above|set:/org/gnome/desktop/wm/keybindings/move-to-monitor-up
+SUPER + SHIFT + ALT + DOWN|Move window to the monitor below|set:/org/gnome/desktop/wm/keybindings/move-to-monitor-down
+SUPER + J|Toggle split direction|none:Tiling Shell has fixed layouts; Super+L switches to the next one
+SUPER + P (Omarchy)|Pseudo tile|none:no GNOME equivalent (Super+P stays display mode)
+SUPER + MINUS|Narrower main area|kit:/org/gnome/shell/extensions/kit-tiling/shrink-main
+SUPER + PLUS|Wider main area|kit:/org/gnome/shell/extensions/kit-tiling/grow-main
+SUPER + G|Window grouping (tabs)|none:no GNOME equivalent
+SUPER + S (Omarchy)|Scratchpad|none:GNOME keeps Super+S for quick settings
+SUPER + SHIFT + ALT + arrows (Omarchy)|Move workspace to monitor|none:on GNOME these keys move the window to that monitor
+CTRL + ALT + TAB|Focus next monitor|none:no GNOME equivalent
+SUPER + C / V / X|Universal copy / paste / cut|none:needs key injection; use Ctrl+C/V/X (Ctrl+Shift+C/V in terminals)
+SUPER + CTRL + V|Clipboard history|clip:/org/gnome/shell/extensions/clipboard-indicator/toggle-menu
+SUPER + COMMA|Notifications (Super+V too)|set:/org/gnome/shell/keybindings/toggle-message-tray
+SUPER + CTRL + E|Emoji picker (then paste with Ctrl+V)|custom:@BIN@/kit-desk emoji
+SUPER + SHIFT + SPACE|Toggle top bar|none:not shipped
+SUPER + BACKSPACE|Toggle transparency|none:no GNOME equivalent
+SUPER + CTRL + SPACE|Background switcher|none:kit-desk theme sets a solid background
+SUPER + CTRL + A|Sound settings|custom:@BIN@/kit-desk settings sound
+SUPER + CTRL + B|Bluetooth settings|custom:@BIN@/kit-desk settings bluetooth
+SUPER + CTRL + W|Network settings|custom:@BIN@/kit-desk settings network
+SUPER + CTRL + D|Display settings|custom:@BIN@/kit-desk settings display
+SUPER + CTRL + P|Power settings|custom:@BIN@/kit-desk settings power
+SUPER + CTRL + S|All settings|custom:@BIN@/kit-desk settings
+SUPER + SHIFT + (A C E G M O P S W X Y D SLASH)|Web apps and preinstalled apps|none:Omarchy apps and private services are not part of the kit

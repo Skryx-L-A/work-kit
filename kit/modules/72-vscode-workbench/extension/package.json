@@ -1,0 +1,526 @@
+{
+  "name": "kit-workbench",
+  "displayName": "Kit Workbench",
+  "description": "Orchestrator and workers inside VS Code: CLI harnesses in terminals, VS Code language models, and OpenAI-compatible APIs.",
+  "version": "0.3.0",
+  "publisher": "work-kit",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "kitWorkbench.spawnWorker",
+        "title": "Spawn Worker",
+        "category": "Kit Workbench",
+        "icon": "$(add)"
+      },
+      {
+        "command": "kitWorkbench.startOrchestratorTerminal",
+        "title": "Start Orchestrator in Terminal",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.openOrchestratorPanel",
+        "title": "Open Orchestrator Panel",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.refresh",
+        "title": "Refresh Workers",
+        "category": "Kit Workbench",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kitWorkbench.openResult",
+        "title": "Open Result",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.openTask",
+        "title": "Open Task",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.showWorker",
+        "title": "Show Worker",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.stopWorker",
+        "title": "Stop Worker",
+        "category": "Kit Workbench",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "kitWorkbench.listModels",
+        "title": "List Models",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.discoverModels",
+        "title": "Discover Local Models",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.openRegistry",
+        "title": "Open Model Registry",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.setApiKey",
+        "title": "Set Provider API Key",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.brainSearch",
+        "title": "Search Brain",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.openOverview",
+        "title": "Open Worker Overview",
+        "category": "Kit Workbench",
+        "icon": "$(layout)"
+      },
+      {
+        "command": "kitWorkbench.viewResult",
+        "title": "View Result",
+        "category": "Kit Workbench",
+        "icon": "$(output)"
+      },
+      {
+        "command": "kitWorkbench.rerunWorker",
+        "title": "Run Again with Model…",
+        "category": "Kit Workbench",
+        "icon": "$(debug-rerun)"
+      },
+      {
+        "command": "kitWorkbench.spawnFromTemplate",
+        "title": "Spawn Worker from Template",
+        "category": "Kit Workbench",
+        "icon": "$(notebook-template)"
+      },
+      {
+        "command": "kitWorkbench.openTemplatesFolder",
+        "title": "Open Task Templates Folder",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.setDefaultWorkerModel",
+        "title": "Set Default Worker Model",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.archiveRuns",
+        "title": "Archive Finished Runs",
+        "category": "Kit Workbench",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "kitWorkbench.archiveRun",
+        "title": "Archive Run",
+        "category": "Kit Workbench",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "kitWorkbench.refreshStatus",
+        "title": "Refresh Status",
+        "category": "Kit Workbench",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kitWorkbench.sendSelectionToOrchestrator",
+        "title": "Send Selection to Orchestrator",
+        "category": "Kit Workbench"
+      },
+      {
+        "command": "kitWorkbench.sendFileToOrchestrator",
+        "title": "Send File to Orchestrator",
+        "category": "Kit Workbench"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kitWorkbench",
+          "title": "Kit Workbench",
+          "icon": "media/activity-bar.svg"
+        }
+      ]
+    },
+    "views": {
+      "kitWorkbench": [
+        {
+          "id": "kitWorkbench.workers",
+          "name": "Workers",
+          "contextualTitle": "Kit Workbench"
+        },
+        {
+          "id": "kitWorkbench.status",
+          "name": "Status",
+          "contextualTitle": "Kit Workbench"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "kitWorkbench.workers",
+        "contents": "No workers yet.\n[Spawn Worker](command:kitWorkbench.spawnWorker)\n[Spawn from Template](command:kitWorkbench.spawnFromTemplate)\n[Open Orchestrator Panel](command:kitWorkbench.openOrchestratorPanel)\n[Start Orchestrator in Terminal](command:kitWorkbench.startOrchestratorTerminal)\nIn the Chat view, ask @workbench."
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "kitWorkbench.openOverview",
+          "when": "view == kitWorkbench.workers",
+          "group": "navigation@0"
+        },
+        {
+          "command": "kitWorkbench.spawnFromTemplate",
+          "when": "view == kitWorkbench.workers",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kitWorkbench.spawnWorker",
+          "when": "view == kitWorkbench.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "kitWorkbench.refresh",
+          "when": "view == kitWorkbench.workers",
+          "group": "navigation"
+        },
+        {
+          "command": "kitWorkbench.archiveRuns",
+          "when": "view == kitWorkbench.workers",
+          "group": "2_manage"
+        },
+        {
+          "command": "kitWorkbench.setDefaultWorkerModel",
+          "when": "view == kitWorkbench.workers",
+          "group": "2_manage"
+        },
+        {
+          "command": "kitWorkbench.openTemplatesFolder",
+          "when": "view == kitWorkbench.workers",
+          "group": "2_manage"
+        },
+        {
+          "command": "kitWorkbench.refreshStatus",
+          "when": "view == kitWorkbench.status",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "kitWorkbench.stopWorker",
+          "when": "view == kitWorkbench.workers && viewItem == run-running",
+          "group": "inline"
+        },
+        {
+          "command": "kitWorkbench.openResult",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "kitWorkbench.openTask",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-/",
+          "group": "1_open@2"
+        },
+        {
+          "command": "kitWorkbench.showWorker",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-/",
+          "group": "1_open@3"
+        },
+        {
+          "command": "kitWorkbench.stopWorker",
+          "when": "view == kitWorkbench.workers && viewItem == run-running",
+          "group": "2_stop"
+        },
+        {
+          "command": "kitWorkbench.viewResult",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-/",
+          "group": "1_open@0"
+        },
+        {
+          "command": "kitWorkbench.rerunWorker",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-(done|failed|stopped)$/",
+          "group": "inline"
+        },
+        {
+          "command": "kitWorkbench.rerunWorker",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-(done|failed|stopped)$/",
+          "group": "2_stop@1"
+        },
+        {
+          "command": "kitWorkbench.archiveRun",
+          "when": "view == kitWorkbench.workers && viewItem =~ /^run-(done|failed|stopped)$/",
+          "group": "2_stop@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "kitWorkbench.openResult",
+          "when": "false"
+        },
+        {
+          "command": "kitWorkbench.openTask",
+          "when": "false"
+        },
+        {
+          "command": "kitWorkbench.showWorker",
+          "when": "false"
+        },
+        {
+          "command": "kitWorkbench.archiveRun",
+          "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "kitWorkbench.sendSelectionToOrchestrator",
+          "when": "editorHasSelection",
+          "group": "kitWorkbench@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "kitWorkbench.sendFileToOrchestrator",
+          "when": "!explorerResourceIsFolder",
+          "group": "kitWorkbench@1"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "kitWorkbench.orchestrator",
+        "name": "workbench",
+        "fullName": "Kit Workbench",
+        "description": "Plan work and delegate it to workers (terminals, VS Code models, APIs)",
+        "isSticky": true
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "kit_spawn_worker",
+        "displayName": "Spawn Kit Workbench worker",
+        "toolReferenceName": "kitSpawnWorker",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Start a worker that completes a delegated task and writes a result file. Use for independent, clearly scoped work. Returns the run id.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Short worker name, e.g. 'docs-update'."
+            },
+            "task": {
+              "type": "string",
+              "description": "Complete task description the worker needs."
+            },
+            "model": {
+              "type": "string",
+              "description": "Model id from kit_list_workers' model list; omit for the default worker model."
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Exclusive paths the worker may change, relative to the workspace."
+            },
+            "done": {
+              "type": "string",
+              "description": "Checkable done criterion."
+            }
+          },
+          "required": [
+            "name",
+            "task"
+          ]
+        }
+      },
+      {
+        "name": "kit_list_workers",
+        "displayName": "List Kit Workbench workers and models",
+        "toolReferenceName": "kitListWorkers",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "List worker runs with status and the models available for workers.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "kit_read_result",
+        "displayName": "Read Kit Workbench result",
+        "toolReferenceName": "kitReadResult",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Read the status and result file of a worker run.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "runId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runId"
+          ]
+        }
+      },
+      {
+        "name": "kit_brain_search",
+        "displayName": "Search the brain",
+        "toolReferenceName": "kitBrainSearch",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Hybrid search over the personal work notes (brain). Use before non-trivial work.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "k": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "kit_read_skill",
+        "displayName": "Read a kit skill",
+        "toolReferenceName": "kitReadSkill",
+        "canBeReferencedInPrompt": true,
+        "modelDescription": "Read the full SKILL.md of an installed skill by name.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "kitWorkbench.brain",
+        "label": "Kit brain"
+      }
+    ],
+    "configuration": {
+      "title": "Kit Workbench",
+      "properties": {
+        "kitWorkbench.registryPath": {
+          "type": "string",
+          "default": "~/.config/work-kit/workbench/models.json",
+          "description": "Model registry file (providers, harnesses, models)."
+        },
+        "kitWorkbench.stateDir": {
+          "type": "string",
+          "default": "~/.local/share/work-kit/workbench",
+          "description": "Directory for runs, task and result files, and spawn requests."
+        },
+        "kitWorkbench.skillsDir": {
+          "type": "string",
+          "default": "~/.agents/skills",
+          "description": "Skills directory (one folder with SKILL.md per skill)."
+        },
+        "kitWorkbench.rulesFile": {
+          "type": "string",
+          "default": "~/work/kit/modules/30-agent-setup/source/AGENTS.md",
+          "description": "Work rules used when the workspace has no AGENTS.md."
+        },
+        "kitWorkbench.brainCommand": {
+          "type": "string",
+          "default": "brain",
+          "description": "Command of the brain CLI (module 20-brain)."
+        },
+        "kitWorkbench.defaultWorkerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model id used when a spawn request names none. Empty: ask, or the first VS Code language model."
+        },
+        "kitWorkbench.brainSearch": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Include the knowledge search step (kit brain) in the worker protocol. Switch off per project in workspace settings, or per task (kit-wb spawn --no-brain, tool input brain=false)."
+        },
+        "kitWorkbench.revealWorkers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a new worker's terminal (or the output channel for API workers) without taking focus."
+        },
+        "kitWorkbench.workerAutonomy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add the harness autonomy flags (e.g. skip permission prompts) to terminal workers."
+        },
+        "kitWorkbench.confirmCloudModels": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask once per provider and session before sending data to a model whose data does not stay local."
+        },
+        "kitWorkbench.maxSteps": {
+          "type": "number",
+          "default": 40,
+          "minimum": 1,
+          "description": "Maximum model turns of an API worker or orchestrator turn."
+        },
+        "kitWorkbench.promptDelayMs": {
+          "type": "number",
+          "default": 2500,
+          "minimum": 0,
+          "description": "Delay before the task prompt is typed into a terminal worker whose harness takes no prompt argument."
+        },
+        "kitWorkbench.templatesDir": {
+          "type": "string",
+          "default": "~/.config/work-kit/workbench/templates",
+          "description": "Your task templates (Markdown with frontmatter). A file with the name of a built-in template replaces it."
+        },
+        "kitWorkbench.quietMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "description": "The worker overview flags a running worker whose files did not change for this many minutes (0: never)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:host": "node test/host/run.mjs",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "package": "npm run check && vsce package --no-dependencies --allow-missing-repository --skip-license -o ../kit-workbench.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/vscode": "1.101.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}

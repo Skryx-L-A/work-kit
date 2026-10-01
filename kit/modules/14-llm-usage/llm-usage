@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# llm-usage launcher: finds a Python >= 3.11 and runs llm_usage.py. Adds start/stop/status for a
+# background proxy. Everything else is passed to llm_usage.py (llm-usage --help).
+#   llm-usage start [proxy options]   background proxy, log in $LLM_USAGE_HOME/proxy.log
+#   llm-usage stop                    stop the background proxy
+#   llm-usage status                  is it running? (exit 3 when not)
+#   llm-usage start|stop|status -h    this text (start -h also lists the proxy options)
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+LIB="${LLM_USAGE_LIB:-$(cd "$(dirname "$SELF")" && pwd)/llm_usage.py}"
+[ -f "$LIB" ] || LIB="${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/llm-usage-lib/llm_usage.py"
+HOME_DIR="${LLM_USAGE_HOME:-${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/llm-usage}"
+PID_FILE="$HOME_DIR/proxy.pid"
+
+pick_python() {
+  local py
+  for py in python3.13 python3.12 python3.11 python3; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+      echo "$py"; return 0
+    fi
+  done
+  return 1
+}
+
+run_py() {
+  local py
+  if py="$(pick_python)"; then exec "$py" "$LIB" "$@"; fi
+  if command -v uv >/dev/null 2>&1 || [ -x "$HOME/.local/bin/uv" ]; then
+    exec "$(command -v uv || echo "$HOME/.local/bin/uv")" run --no-project --offline --python 3.12 python "$LIB" "$@"
+  fi
+  echo "llm-usage: needs Python >= 3.11 (system python3 or the kit's 00-python module)" >&2
+  exit 1
+}
+
+usage() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$SELF"; }
+
+# start/stop/status: help is answered here and never acts; stop/status take no other argument.
+case "${1:-}" in
+  start)
+    for a in "${@:2}"; do
+      case "$a" in -h|--help) usage; echo; run_py proxy --help ;; esac
+    done ;;
+  stop|status)
+    for a in "${@:2}"; do
+      case "$a" in
+        -h|--help) usage; exit 0 ;;
+        *) echo "llm-usage $1: unexpected argument: $a" >&2; usage >&2; exit 2 ;;
+      esac
+    done ;;
+esac
+
+alive() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+
+case "${1:-}" in
+  start)
+    shift
+    if alive; then echo "llm-usage: proxy already running (pid $(cat "$PID_FILE"))"; exit 0; fi
+    mkdir -p "$HOME_DIR"
+    nohup "$0" proxy "$@" >>"$HOME_DIR/proxy.log" 2>&1 </dev/null &
+    echo $! >"$PID_FILE"
+    for _ in $(seq 1 30); do
+      grep -q 'llm-usage proxy:' <(tail -n 3 "$HOME_DIR/proxy.log") && break
+      alive || { tail -n 5 "$HOME_DIR/proxy.log" >&2; rm -f "$PID_FILE"; exit 1; }
+      sleep 0.2
+    done
+    tail -n 1 "$HOME_DIR/proxy.log"
+    echo "llm-usage: proxy pid $(cat "$PID_FILE"); point tools at the URL above"
+    ;;
+  stop)
+    if alive; then
+      pid="$(cat "$PID_FILE")"; kill "$pid"
+      for _ in $(seq 1 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid"
+      echo "llm-usage: proxy stopped (pid $pid)"
+    else
+      echo "llm-usage: proxy not running"
+    fi
+    rm -f "$PID_FILE"
+    ;;
+  status)
+    if alive; then echo "llm-usage: proxy running (pid $(cat "$PID_FILE")); $(grep 'llm-usage proxy:' "$HOME_DIR/proxy.log" | tail -n 1)"
+    else echo "llm-usage: proxy not running"; exit 3; fi
+    ;;
+  *) run_py "$@" ;;
+esac

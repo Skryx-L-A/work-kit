@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "required": ["invoice_number", "date", "total", "currency"],
+  "additionalProperties": false,
+  "properties": {
+    "invoice_number": {"type": "string", "pattern": "^[A-Z]{2,4}-[0-9]+$"},
+    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "total": {"type": "number", "minimum": 0},
+    "currency": {"enum": ["EUR", "USD", "GBP"]}
+  }
+}

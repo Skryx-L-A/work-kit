@@ -1,0 +1,14 @@
+{
+  "flags": [
+    "--continue"
+  ],
+  "kennwort": "merkwort-plumbus",
+  "verzeichnis_a": "<probe>/sitzung-a",
+  "zwei_kennwort": false,
+  "zwei_fortsetzwort": true,
+  "vier_fortsetzwort": false,
+  "drei_kennwort": false,
+  "drei_nennt_verzeichnis_a": false,
+  "vier_kennwort": false,
+  "belegzeile_drei": ""
+}

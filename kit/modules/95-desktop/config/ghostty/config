@@ -1,0 +1,15 @@
+# Ghostty config from work-kit 95-desktop. Yours to edit; the kit never overwrites it.
+# Colours come from `kit-desk theme` (Super+Shift+Ctrl+Space).
+config-file = ?@THEME_DIR@/ghostty.conf
+font-family = "JetBrainsMono Nerd Font"
+font-size = 10
+# No wasted space: no title bar, no padding (tiling handles placement)
+window-decoration = none
+window-padding-x = 0
+window-padding-y = 0
+window-padding-balance = true
+confirm-close-surface = false
+resize-overlay = never
+shell-integration-features = no-cursor
+cursor-style = block
+mouse-hide-while-typing = true

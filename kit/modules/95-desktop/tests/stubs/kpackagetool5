@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test stub of kpackagetool5/6: installs a .kwinscript (zip) into ~/.local/share/kwin/scripts/<id>
+set -eu
+d="${XDG_DATA_HOME:-$HOME/.local/share}/kwin/scripts"
+case "$2" in
+  -i|-u) mkdir -p "$d/krohnkite"; cp "$3" "$d/krohnkite/package" ;;
+  -r) rm -rf "${d:?}/$3" ;;
+esac

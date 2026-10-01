@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.kit-tiling" path="/org/gnome/shell/extensions/kit-tiling/">
+    <key name="focus-window-left" type="as">
+      <default>[]</default>
+      <summary>Focus the window on the left</summary>
+    </key>
+    <key name="focus-window-right" type="as">
+      <default>[]</default>
+      <summary>Focus the window on the right</summary>
+    </key>
+    <key name="focus-window-up" type="as">
+      <default>[]</default>
+      <summary>Focus the window above</summary>
+    </key>
+    <key name="focus-window-down" type="as">
+      <default>[]</default>
+      <summary>Focus the window below</summary>
+    </key>
+    <key name="move-window-left" type="as">
+      <default>[]</default>
+      <summary>Swap with the window on the left (or move to the monitor there)</summary>
+    </key>
+    <key name="move-window-right" type="as">
+      <default>[]</default>
+      <summary>Swap with the window on the right (or move to the monitor there)</summary>
+    </key>
+    <key name="move-window-up" type="as">
+      <default>[]</default>
+      <summary>Swap with the window above</summary>
+    </key>
+    <key name="move-window-down" type="as">
+      <default>[]</default>
+      <summary>Swap with the window below</summary>
+    </key>
+    <key name="untile-window" type="as">
+      <default>[]</default>
+      <summary>Float the window, or tile it again</summary>
+    </key>
+    <key name="cycle-layouts" type="as">
+      <default>[]</default>
+      <summary>Next layout: main left, main on top</summary>
+    </key>
+    <key name="span-window-all-tiles" type="as">
+      <default>[]</default>
+      <summary>Monocle: every window fills the work area, or back</summary>
+    </key>
+    <key name="shrink-main" type="as">
+      <default>[]</default>
+      <summary>Narrower main area</summary>
+    </key>
+    <key name="grow-main" type="as">
+      <default>[]</default>
+      <summary>Wider main area</summary>
+    </key>
+    <key name="window-to-monitor-left" type="as">
+      <default>[]</default>
+      <summary>Move the window to the monitor on the left</summary>
+    </key>
+    <key name="window-to-monitor-right" type="as">
+      <default>[]</default>
+      <summary>Move the window to the monitor on the right</summary>
+    </key>
+    <key name="window-to-monitor-up" type="as">
+      <default>[]</default>
+      <summary>Move the window to the monitor above</summary>
+    </key>
+    <key name="window-to-monitor-down" type="as">
+      <default>[]</default>
+      <summary>Move the window to the monitor below</summary>
+    </key>
+    <key name="main-ratio" type="d">
+      <range min="0.2" max="0.8"/>
+      <default>0.5</default>
+      <summary>Share of the main area (1 = whole work area)</summary>
+      <description>Default for a workspace and monitor whose split was not changed since login.</description>
+    </key>
+    <key name="border-width" type="i">
+      <range min="0" max="8"/>
+      <default>2</default>
+      <summary>Border around every tiled window, in pixels (0 = none)</summary>
+      <description>Drawn inside the window's tile, so windows never overlap it; the focused window's border has border-color, the others inactive-border-color.</description>
+    </key>
+    <key name="border-color" type="s">
+      <default>'#7fbbb3'</default>
+      <summary>Border colour of the focused window (CSS colour; kit-desk theme sets the theme's accent)</summary>
+    </key>
+    <key name="inactive-border-color" type="s">
+      <default>'#475258'</default>
+      <summary>Border colour of the other tiled windows (CSS colour)</summary>
+    </key>
+    <key name="float-classes" type="as">
+      <default>['zenity']</default>
+      <summary>WM classes that always float (zenity: the kit's own menus, centred like Omarchy's)</summary>
+    </key>
+  </schema>
+</schemalist>

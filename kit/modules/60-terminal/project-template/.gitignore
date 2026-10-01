@@ -1,0 +1,28 @@
+# environment and secrets
+.env
+.env.*
+!.env.example
+.direnv/
+*.pem
+*.key
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# node
+node_modules/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.bak-*
+
+# local outputs
+out/
+tmp/

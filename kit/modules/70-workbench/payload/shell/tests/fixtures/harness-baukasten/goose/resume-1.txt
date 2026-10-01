@@ -1,0 +1,50 @@
+
+    __( O)>  ● new session · ollama qwen3:1.7b
+   \____)    20260808_3 · <probe>/sitzung-a
+     L L     goose is ready
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0% 0/128k
+> Merke dir das Wort merkwort-plumbus und antworte nur mit OK.
+
+◓  Building thought graphs...  (Ctrl+C to interrupt)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

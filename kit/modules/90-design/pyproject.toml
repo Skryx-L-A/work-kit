@@ -1,0 +1,23 @@
+[project]
+name = "kit-design"
+version = "0.1.0"
+description = "Offline design tooling: Markdown to PPTX and HTML slides, print documents, web prototype template, design references"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["python-pptx>=1.0", "markdown>=3.5"]
+
+[project.scripts]
+kit-design = "kitdesign.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kitdesign"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

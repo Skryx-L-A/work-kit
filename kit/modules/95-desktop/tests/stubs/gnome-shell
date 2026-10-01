@@ -1,0 +1,2 @@
+#!/bin/sh
+[ "$1" = --version ] && echo "GNOME Shell ${FAKE_GNOME:-46}.0"

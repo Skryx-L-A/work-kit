@@ -1,0 +1,14 @@
+{
+  "source": "2fc9ec41",
+  "electron": "40.10.6",
+  "nodePty": "1.2.0-beta.14",
+  "dist": [
+    "main",
+    "preload",
+    "renderer",
+    "einstellungen",
+    "sitzung",
+    "verbrauch",
+    "erststart"
+  ]
+}

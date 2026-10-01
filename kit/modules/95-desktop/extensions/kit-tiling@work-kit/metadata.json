@@ -1,0 +1,8 @@
+{
+  "uuid": "kit-tiling@work-kit",
+  "name": "work-kit tiling",
+  "description": "Omarchy-like automatic tiling without gaps, with a thin border around each window: one window fills the screen, two split it, three or more make a main area and a stack. Part of work-kit module 95-desktop.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.kit-tiling",
+  "version": 1
+}

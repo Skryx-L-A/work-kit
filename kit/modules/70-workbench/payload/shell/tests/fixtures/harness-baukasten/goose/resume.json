@@ -1,0 +1,14 @@
+{
+  "flags": [
+    "-r"
+  ],
+  "kennwort": "merkwort-plumbus",
+  "verzeichnis_a": "<probe>/sitzung-a",
+  "zwei_kennwort": false,
+  "zwei_fortsetzwort": true,
+  "vier_fortsetzwort": false,
+  "drei_kennwort": false,
+  "drei_nennt_verzeichnis_a": true,
+  "vier_kennwort": false,
+  "belegzeile_drei": "◆  WARNING: The original working directory of this session was set to <probe>/sitzung-a. Your current directory is /private/var"
+}

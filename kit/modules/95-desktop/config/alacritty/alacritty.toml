@@ -1,0 +1,10 @@
+# Alacritty config from work-kit 95-desktop (used only when Alacritty is installed).
+import = ["@THEME_DIR@/alacritty.toml"]
+
+[window]
+decorations = "None"
+padding = { x = 0, y = 0 }
+
+[font]
+normal = { family = "JetBrainsMono Nerd Font", style = "Regular" }
+size = 10

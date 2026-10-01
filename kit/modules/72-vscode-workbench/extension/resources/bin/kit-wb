@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# kit-wb: delegate work to Kit Workbench workers from any terminal agent.
+# Writes spawn requests that the Kit Workbench VS Code extension turns into worker runs.
+set -euo pipefail
+
+STATE="${KIT_WB_STATE:-$HOME/.local/share/work-kit/workbench}"
+RUNS="$STATE/runs"
+REQS="$STATE/requests"
+
+usage() {
+  cat <<'USAGE'
+usage:
+  kit-wb spawn --name NAME [--model ID] [--paths a,b] [--done TEXT] [--cwd DIR] [--no-brain]
+               (--task-file FILE | -)          task from a file or stdin; prints the run id
+  kit-wb list                                  runs, newest first
+  kit-wb result RUN-ID                         status and result
+  kit-wb wait RUN-ID [--timeout SECONDS]       wait until the run ends (default 3600 s)
+USAGE
+}
+
+die() { echo "kit-wb: $*" >&2; exit 1; }
+
+# Extracts a top-level string field from a flat JSON file without jq.
+json_field() {
+  sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\"\\(.*\\)\",\\{0,1\\}[[:space:]]*$/\\1/p" "$1" | head -n1
+}
+
+one_line() { printf '%s' "$1" | tr '\r\n' '  '; }
+
+cmd_spawn() {
+  local name="" model="" paths="" done_text="" cwd="$PWD" task_file="" brain="on" timeout=30
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --paths) paths="$2"; shift 2 ;;
+      --done) done_text="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --task-file) task_file="$2"; shift 2 ;;
+      --no-brain) brain="off"; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      -) task_file="-"; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ -n "$name" ] || die "--name is required"
+  [ -n "$task_file" ] || die "give --task-file FILE or - for stdin"
+  local id dir
+  id="$(date -u +%Y%m%d-%H%M%S)-$$-$RANDOM"
+  dir="$REQS/$id"
+  mkdir -p "$dir"
+  if [ "$task_file" = "-" ]; then cat > "$dir/task.md"; else cp "$task_file" "$dir/task.md"; fi
+  [ -s "$dir/task.md" ] || { rm -rf "$dir"; die "task is empty"; }
+  # `request` is written last: its presence marks a complete request.
+  {
+    echo "name=$(one_line "$name")"
+    echo "model=$(one_line "$model")"
+    echo "paths=$(one_line "$paths")"
+    echo "done=$(one_line "$done_text")"
+    echo "cwd=$(one_line "$cwd")"
+    echo "brain=$brain"
+  } > "$dir/request.tmp"
+  mv "$dir/request.tmp" "$dir/request"
+  local waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if [ -f "$dir/run-id" ]; then
+      cat "$dir/run-id"
+      return 0
+    fi
+    if [ -f "$dir/error" ]; then
+      die "request rejected: $(cat "$dir/error")"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "no answer after ${timeout}s: is VS Code with the Kit Workbench extension running? (request left in $dir)"
+}
+
+cmd_list() {
+  [ -d "$RUNS" ] || { echo "no runs"; return 0; }
+  local dirs=("$RUNS"/*/) i d
+  for ((i = ${#dirs[@]} - 1; i >= 0; i--)); do
+    d="$(basename "${dirs[$i]}")"
+    [ -f "$RUNS/$d/meta.json" ] || continue
+    printf '%s  %-8s  %-24s  %s\n' "$d" "$(json_field "$RUNS/$d/meta.json" status)" \
+      "$(json_field "$RUNS/$d/meta.json" name)" "$(json_field "$RUNS/$d/meta.json" modelLabel)"
+  done
+}
+
+cmd_result() {
+  local id="${1:-}" meta
+  [ -n "$id" ] || die "result needs a RUN-ID"
+  meta="$RUNS/$id/meta.json"
+  [ -f "$meta" ] || die "no run $id"
+  echo "status: $(json_field "$meta" status)"
+  local reason; reason="$(json_field "$meta" reason)"
+  [ -z "$reason" ] || echo "reason: $reason"
+  echo "result file: $RUNS/$id/result.md"
+  echo
+  if [ -f "$RUNS/$id/result.md" ]; then cat "$RUNS/$id/result.md"; else echo "(no result yet)"; fi
+}
+
+cmd_wait() {
+  local id="${1:-}" timeout=3600 waited=0 status
+  [ -n "$id" ] || die "wait needs a RUN-ID"
+  shift
+  [ "${1:-}" != "--timeout" ] || timeout="$2"
+  [ -f "$RUNS/$id/meta.json" ] || die "no run $id"
+  while :; do
+    status="$(json_field "$RUNS/$id/meta.json" status)"
+    if [ "$status" != "running" ]; then
+      cmd_result "$id"
+      [ "$status" = "done" ]
+      return
+    fi
+    [ "$waited" -lt "$timeout" ] || die "timeout after ${timeout}s, run $id still running"
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+case "${1:-}" in
+  spawn) shift; cmd_spawn "$@" ;;
+  list) shift; cmd_list ;;
+  result) shift; cmd_result "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

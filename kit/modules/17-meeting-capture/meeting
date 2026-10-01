@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""meeting: record a meeting locally, transcribe it with a local whisper server, save a note.
+
+Nothing leaves the laptop: audio is recorded with pw-record or parecord, transcribed by a
+whisper.cpp server on 127.0.0.1 (the engine of module 80-quassel), and the result becomes a
+note in the brain (`brain new note`) or, without a brain, a file in ~/work/meetings/.
+
+Every recording starts with a consent reminder. Read the policy first: `meeting policy`.
+
+Commands:
+  start [--title T] [--project P] [--participants "A, B"] [--source mic|system|both]
+        [--consent-given]          consent reminder, then start recording in the background
+  stop  [--keep-audio] [--no-transcribe] [--language de|en|...] [--summarize]
+                                    stop, transcribe, write the note
+  status                            recording or idle
+  cancel                            stop and delete the recording
+  transcribe FILE.wav [--title T] [--project P] [--language L] [--summarize] [--keep-audio]
+                                    transcribe an existing 16 kHz mono WAV, write the note
+  engine                            check the speech engine and the note destination
+  policy [--todo]                   show the policy file (or only its TODO(ask IT) lines)
+  purge [--days N]                  delete old audio and old notes in ~/work/meetings/
+"""
+import argparse
+import array
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+
+RATE = 16000
+CONF_KEYS = ("whisper_url", "summary_url", "summary_model", "store", "transcript_in_brain",
+             "meetings_dir", "retention_days", "language", "project")
+
+CONSENT_REMINDER = """\
+CONSENT REMINDER (read before every recording)
+  - Everyone taking part must know that this meeting is recorded and transcribed,
+    and must agree BEFORE you start. Say it out loud at the start of the meeting.
+  - If anyone objects, do not record. Take notes by hand instead.
+  - No recording of HR, personnel, legal or customer-confidential talks unless the policy
+    and the customer allow it. Run `meeting policy` if you are unsure.
+  - Audio stays on this laptop. It is deleted after the transcript exists.
+"""
+
+
+# --- paths and settings ----------------------------------------------------------------------
+
+def home():
+    return os.path.expanduser("~")
+
+
+def data_dir():
+    return os.path.join(os.environ.get("KIT_DATA_DIR") or os.path.join(home(), ".local/share/work-kit"),
+                        "meeting-capture")
+
+
+def conf_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home(), ".config"),
+                        "work-kit")
+
+
+def state_dir():
+    d = os.path.join(data_dir(), "state")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def quassel_home():
+    return os.environ.get("QUASSEL_KIT_HOME") or os.path.join(
+        os.environ.get("KIT_DATA_DIR") or os.path.join(home(), ".local/share/work-kit"), "quassel")
+
+
+def quassel_env_file():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home(), ".config"),
+                        "quassel", "server.env")
+
+
+def read_keyvals(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def settings():
+    """meeting.conf (key=value), overridden by MEETING_<KEY> environment variables."""
+    s = read_keyvals(os.path.join(conf_dir(), "meeting.conf"))
+    for k in CONF_KEYS:
+        v = os.environ.get("MEETING_" + k.upper())
+        if v:
+            s[k] = v
+    return s
+
+
+def meetings_dir(s):
+    return os.path.expanduser(s.get("meetings_dir") or os.path.join(home(), "work", "meetings"))
+
+
+def info(msg):
+    print(msg, file=sys.stderr)
+
+
+def slug(text):
+    t = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (t or "meeting")[:50]
+
+
+def now():
+    return datetime.datetime.now().replace(microsecond=0)
+
+
+# --- recording ---------------------------------------------------------------------------------
+
+def recorder_command(source, out):
+    """Command that records 16 kHz mono 16-bit WAV to `out`. None when no recorder exists."""
+    custom = os.environ.get("MEETING_RECORD_CMD")
+    if custom:
+        return [a.replace("{out}", out).replace("{source}", source) for a in custom.split()]
+    if shutil.which("pw-record"):
+        cmd = ["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16"]
+        if source == "system":
+            cmd += ["-P", "stream.capture.sink=true"]
+        return cmd + [out]
+    if shutil.which("parecord"):
+        cmd = ["parecord", "--rate=%d" % RATE, "--channels=1", "--format=s16le", "--file-format=wav"]
+        if source == "system":
+            cmd += ["--device=@DEFAULT_MONITOR@"]
+        return cmd + [out]
+    return None
+
+
+def alive(pid, marker=None):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:                                      # guard against a reused pid (Linux only)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            cmdline = f.read().decode("utf-8", "replace")
+        if marker and marker not in cmdline:
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def state_path():
+    return os.path.join(state_dir(), "current.json")
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(st):
+    p = state_path()
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.chmod(p + ".tmp", 0o600)
+    os.replace(p + ".tmp", p)
+
+
+def recording_alive(st):
+    return bool(st) and any(alive(r["pid"], os.path.basename(r["out"])) for r in st["recorders"])
+
+
+def ask_consent(given_flag):
+    sys.stderr.write(CONSENT_REMINDER)
+    if given_flag:
+        info("Consent confirmed with --consent-given.")
+        return True
+    if not sys.stdin.isatty():
+        info("Not a terminal: pass --consent-given once all participants agreed.")
+        return False
+    sys.stderr.write("Have all participants agreed to the recording? [y/N] ")
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower() in ("y", "yes", "j", "ja")
+
+
+def cmd_start(a):
+    st = load_state()
+    if recording_alive(st):
+        info("Already recording since %s. Run `meeting stop`." % st["started"])
+        return 1
+    if not ask_consent(a.consent_given):
+        info("Not recording.")
+        return 1
+    sources = ["mic", "system"] if a.source == "both" else [a.source]
+    stamp = now().strftime("%Y%m%d-%H%M%S")
+    audio_dir = os.path.join(state_dir(), "audio")
+    os.makedirs(audio_dir, mode=0o700, exist_ok=True)
+    recorders = []
+    for src in sources:
+        out = os.path.join(audio_dir, "%s-%s.wav" % (stamp, src))
+        cmd = recorder_command(src, out)
+        if not cmd:
+            info("No recorder found (pw-record or parecord). Install PipeWire or PulseAudio tools.")
+            _kill_recorders(recorders)
+            return 1
+        log = open(os.path.join(state_dir(), "recorder.log"), "ab")
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True)
+        except OSError as e:
+            info("Cannot start the recorder: %s" % e)
+            _kill_recorders(recorders)
+            return 1
+        finally:
+            log.close()
+        recorders.append({"pid": p.pid, "out": out, "source": src})
+    time.sleep(0.3)
+    for r in recorders:
+        if not alive(r["pid"], os.path.basename(r["out"])) and not os.path.exists(r["out"]):
+            info("Recorder exited immediately, see %s" % os.path.join(state_dir(), "recorder.log"))
+            _kill_recorders(recorders)
+            return 1
+    save_state({"started": now().isoformat(), "title": a.title or "", "project": a.project or "",
+                "participants": a.participants or "", "recorders": recorders,
+                "consent": "confirmed by the user before recording"})
+    info("Recording (%s). Run `meeting stop` when the meeting is over." % "+".join(sources))
+    return 0
+
+
+def _stop_pid(pid, marker):
+    for sig, wait in ((signal.SIGINT, 8.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+        if not alive(pid, marker):
+            return
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            return
+        end = time.monotonic() + wait
+        while time.monotonic() < end and alive(pid, marker):
+            time.sleep(0.05)
+
+
+def _kill_recorders(recorders):
+    for r in recorders:
+        _stop_pid(r["pid"], os.path.basename(r["out"]))
+        try:
+            os.remove(r["out"])
+        except OSError:
+            pass
+
+
+def mix_wavs(paths, dest):
+    """Mix mono 16-bit WAVs of equal rate into dest (pure Python, sums with clipping)."""
+    tracks = []
+    for p in paths:
+        with wave.open(p, "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
+                raise ValueError("%s is not 16 kHz mono 16-bit" % p)
+            t = array.array("h")
+            t.frombytes(w.readframes(w.getnframes()))
+            if sys.byteorder == "big":
+                t.byteswap()
+            tracks.append(t)
+    n = max(len(t) for t in tracks)
+    mixed = array.array("h", [0]) * n
+    for t in tracks:
+        for i, v in enumerate(t):
+            s = mixed[i] + v
+            mixed[i] = 32767 if s > 32767 else -32768 if s < -32768 else s
+    if sys.byteorder == "big":
+        mixed.byteswap()
+    with wave.open(dest, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(mixed.tobytes())
+
+
+def wav_seconds(path):
+    with wave.open(path, "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def finish_recording(st):
+    """Stop all recorders, return the path of one WAV (mixed when there were two)."""
+    for r in st["recorders"]:
+        _stop_pid(r["pid"], os.path.basename(r["out"]))
+    outs = [r["out"] for r in st["recorders"] if os.path.exists(r["out"])]
+    if not outs:
+        return None
+    if len(outs) == 1:
+        return outs[0]
+    mixed = os.path.join(os.path.dirname(outs[0]), "mixed-" + os.path.basename(outs[0]))
+    try:
+        mix_wavs(outs, mixed)
+    except (OSError, ValueError, wave.Error) as e:
+        info("Could not mix the tracks (%s); using the first one." % e)
+        return outs[0]
+    return mixed
+
+
+# --- speech engine -----------------------------------------------------------------------------
+
+INSTALL_HINT = (
+    "No local speech engine found. Install module 80-quassel (it ships the whisper.cpp engine\n"
+    "and the models):  bash <kit>/modules/80-quassel/install.sh\n"
+    "or run your own whisper.cpp server and set whisper_url in ~/.config/work-kit/meeting.conf\n"
+    "(for example whisper_url=http://127.0.0.1:8765). The audio was kept."
+)
+
+
+def http_ok(url, timeout=2):
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout) as r:
+            return r.status < 500
+    except urllib.error.HTTPError as e:
+        return e.code < 500
+    except (OSError, ValueError):
+        return False
+
+
+def quassel_engine():
+    """(server binary, argv without host/port) from 80-quassel's server.env, or None."""
+    env = read_keyvals(quassel_env_file())
+    binary, model = env.get("SERVER_BIN"), env.get("MODEL_PATH")
+    if not (binary and os.access(binary, os.X_OK) and model and os.path.isfile(model)
+            and os.path.getsize(model) > 0):
+        return None
+    argv = [binary, "-m", model, "-t", env.get("WHISPER_THREADS") or "4", "-l", "auto"]
+    argv += (env.get("WHISPER_DECODE") or "-nf").split()
+    vad = env.get("VAD_MODEL")
+    if vad and os.path.exists(vad):
+        argv += ["--vad", "--vad-model", vad]
+    return argv
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Engine:
+    """Context manager: yields the base URL of a whisper server, starting one if needed."""
+
+    def __init__(self, s, wait=180):
+        self.s, self.wait, self.proc, self.url = s, wait, None, None
+
+    def __enter__(self):
+        url = self.s.get("whisper_url")
+        if url:
+            if not is_loopback(url) and os.environ.get("MEETING_WHISPER_ALLOW_REMOTE") != "1":
+                raise RuntimeError("whisper_url %s is not on this machine. Audio stays local "
+                                   "unless IT approved that server (MEETING_WHISPER_ALLOW_REMOTE=1)." % url)
+            if not http_ok(url):
+                raise RuntimeError("whisper server at %s does not answer" % url)
+            self.url = url
+            return self
+        default = "http://127.0.0.1:8765"
+        if http_ok(default):                       # 80-quassel's server is already running
+            self.url = default
+            return self
+        argv = quassel_engine()
+        if not argv:
+            raise LookupError(INSTALL_HINT)
+        port = free_port()
+        info("Starting the local speech engine (loads the model, takes a moment) ...")
+        log = open(os.path.join(state_dir(), "whisper-server.log"), "ab")
+        self.proc = subprocess.Popen(argv + ["--host", "127.0.0.1", "--port", str(port)],
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        log.close()
+        self.url = "http://127.0.0.1:%d" % port
+        end = time.monotonic() + self.wait
+        while not http_ok(self.url):
+            if self.proc.poll() is not None:
+                raise RuntimeError("the speech engine exited, see %s"
+                                   % os.path.join(state_dir(), "whisper-server.log"))
+            if time.monotonic() > end:
+                self.close()
+                raise RuntimeError("the speech engine did not come up in %ds" % self.wait)
+            time.sleep(0.5)
+        return self
+
+    def close(self):
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def multipart(fields, filepath):
+    boundary = "----meeting-" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields:
+        parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+                      % (boundary, k, v)).encode("utf-8"))
+    with open(filepath, "rb") as f:
+        data = f.read()
+    parts.append(('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
+                  "Content-Type: audio/wav\r\n\r\n" % (boundary, os.path.basename(filepath))
+                  ).encode("utf-8") + data + b"\r\n")
+    parts.append(("--%s--\r\n" % boundary).encode("utf-8"))
+    return b"".join(parts), "multipart/form-data; boundary=" + boundary
+
+
+def stamp(seconds):
+    seconds = int(seconds)
+    return "%02d:%02d:%02d" % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
+
+
+def parse_transcript(body):
+    """Transcript text from a whisper-server reply: verbose_json, json or plain text."""
+    try:
+        d = json.loads(body)
+    except ValueError:
+        return body.strip()
+    segs = d.get("segments") if isinstance(d, dict) else None
+    if segs:
+        lines = []
+        for sg in segs:
+            text = (sg.get("text") or "").strip()
+            if text:
+                lines.append("[%s] %s" % (stamp(sg.get("start", 0)), text))
+        if lines:
+            return "\n".join(lines)
+    if isinstance(d, dict):
+        return (d.get("text") or "").strip()
+    return body.strip()
+
+
+def transcribe(wav, s, language=None):
+    seconds = wav_seconds(wav)
+    timeout = 600 + 2 * seconds                    # CPU whisper is slower than real time on 8 GB laptops
+    fields = [("response_format", "verbose_json"), ("temperature", "0.0")]
+    lang = language or s.get("language")
+    if lang:
+        fields.append(("language", lang))
+    with Engine(s) as eng:
+        body, ctype = multipart(fields, wav)
+        req = urllib.request.Request(eng.url.rstrip("/") + "/inference", data=body,
+                                     headers={"Content-Type": ctype})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        info("Transcribing %s of audio ..." % stamp(seconds))
+        log = os.path.join(state_dir(), "whisper-server.log")
+        start = os.path.getsize(log) if os.path.exists(log) else 0
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return parse_transcript(r.read().decode("utf-8", "replace")), seconds
+        except urllib.error.HTTPError as e:
+            # With VAD, audio without speech makes whisper-server fail the language step with 500.
+            if "speech segments after filtering: 0" in read_from(log, start):
+                return "", seconds
+            detail = e.read().decode("utf-8", "replace").strip()[:300]
+            raise RuntimeError("whisper-server answered HTTP %s%s (log: %s)"
+                               % (e.code, ": " + detail if detail else "", log))
+
+
+def read_from(path, offset):
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read(1 << 20).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+# --- summary -------------------------------------------------------------------------------------
+
+def is_loopback(url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def is_kit_models_proxy(url):
+    """The local kit-models proxy: a loopback URL under /e/<endpoint>/ (kit-models proxy start)."""
+    return is_loopback(url) and urllib.parse.urlparse(url).path.startswith("/e/")
+
+
+def summary_key(url):
+    """Bearer key for the summary request, or None. MEETING_SUMMARY_KEY always wins. For the local
+    kit-models proxy (which refuses requests without its token) the token comes from
+    KIT_MODELS_PROXY_KEY, else from the kit-models token file. The key is never printed or logged."""
+    key = (os.environ.get("MEETING_SUMMARY_KEY") or "").strip()
+    if key:
+        return key
+    if not is_kit_models_proxy(url):
+        return None
+    key = (os.environ.get("KIT_MODELS_PROXY_KEY") or "").strip()
+    if key:
+        return key
+    root = os.environ.get("KIT_DATA_DIR") or os.path.join(home(), ".local/share/work-kit")
+    try:
+        with open(os.path.join(root, "model-endpoints", "proxy.token"), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def summarize(text, s):
+    """Summary from an OpenAI-compatible endpoint that the user configured. None if not set."""
+    url = s.get("summary_url")
+    if not url:
+        return None
+    if not is_loopback(url) and os.environ.get("MEETING_SUMMARY_ALLOW_REMOTE") != "1":
+        info("summary_url %s is not on this machine. The policy allows local models only unless\n"
+             "IT approved the model; set MEETING_SUMMARY_ALLOW_REMOTE=1 for one run if it did." % url)
+        return None
+    prompt = ("Summarize this meeting transcript in the language of the transcript. Give: a "
+              "3-5 sentence summary, decisions, action items with owner if named, open "
+              "questions. Use only what is in the transcript; write 'not stated' otherwise.\n\n"
+              + text)
+    payload = {"model": s.get("summary_model") or "local", "temperature": 0.2,
+               "messages": [{"role": "user", "content": prompt}]}
+    headers = {"Content-Type": "application/json"}
+    key = summary_key(url)
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url.rstrip("/") + "/chat/completions",
+                                 data=json.dumps(payload).encode("utf-8"), headers=headers)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=900) as r:
+            return json.loads(r.read().decode("utf-8"))["choices"][0]["message"]["content"].strip()
+    except (OSError, ValueError, KeyError, IndexError) as e:
+        info("Summary failed (%s); the note has an empty summary section." % e)
+        if getattr(e, "code", None) == 401:
+            info("The summary server wants a key: set MEETING_SUMMARY_KEY (the kit-models proxy token is "
+                 "found by itself when summary_url points at it: kit-models proxy start).")
+        return None
+
+
+# --- note ----------------------------------------------------------------------------------------
+
+def build_note(title, when, seconds, participants, transcript, summary, transcript_path, model_note):
+    lines = ["Meeting: %s" % title, "", "- Date: %s" % when.strftime("%Y-%m-%d %H:%M"),
+             "- Length: %s" % stamp(seconds)]
+    if participants:
+        lines.append("- Participants: %s" % participants)
+    lines += ["- Consent: confirmed by the recording user before the recording started",
+              "- Transcript: local whisper.cpp, machine-made, may contain errors. Review before "
+              "sharing.", "- Tags: meeting", ""]
+    lines += ["## Summary", ""]
+    if summary:
+        lines += [summary, "", "_%s_" % model_note, ""]
+    else:
+        lines += ["_Not generated. Read the transcript, or ask an approved local model (see the "
+                  "meeting AI policy: which models may summarize). Fill in: decisions, action "
+                  "items, open questions._", ""]
+    lines += ["## Decisions", "", "- ", "", "## Action items", "", "- ", "", "## Transcript", ""]
+    if transcript_path:
+        lines += ["Stored outside the brain: `%s`" % transcript_path, ""]
+    else:
+        lines += [transcript, ""]
+    return "\n".join(lines)
+
+
+def write_file(path, text):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+
+
+def brain_available():
+    return bool(shutil.which("brain"))
+
+
+def save_note(title, when, seconds, participants, project, transcript, summary, s, model_note):
+    """Write the note to the brain or ~/work/meetings/. Returns a description of where."""
+    mdir = meetings_dir(s)
+    name = "%s-%s" % (when.strftime("%Y-%m-%d-%H%M"), slug(title))
+    store = (s.get("store") or "auto").lower()
+    use_brain = store in ("auto", "brain") and brain_available()
+    if store == "brain" and not use_brain:
+        info("store=brain but the `brain` command is missing; falling back to files.")
+    tpath = None
+    if use_brain and (s.get("transcript_in_brain") or "yes").lower() in ("no", "false", "0"):
+        tpath = os.path.join(mdir, name + ".transcript.md")
+        write_file(tpath, "# Transcript: %s\n\n%s\n" % (title, transcript))
+    note = build_note(title, when, seconds, participants, transcript, summary, tpath, model_note)
+    if use_brain:
+        cmd = ["brain", "new", "note", "Meeting: %s (%s)" % (title, when.strftime("%Y-%m-%d"))]
+        if project:
+            cmd += ["--project", project]
+        cmd += ["--body", "-"]
+        try:
+            r = subprocess.run(cmd, input=note, text=True, capture_output=True, timeout=120)
+            if r.returncode == 0:
+                return "brain note (%s)" % (r.stdout.strip().splitlines() or ["created"])[-1]
+            info("`brain new` failed (%s); writing to %s instead." % (r.stderr.strip()[:200], mdir))
+        except (OSError, subprocess.SubprocessError) as e:
+            info("`brain new` failed (%s); writing to %s instead." % (e, mdir))
+    path = os.path.join(mdir, name + ".md")
+    write_file(path, note)
+    return path
+
+
+def process_audio(wav, a, started, title, participants, project):
+    """Transcribe wav and save the note. Returns an exit code."""
+    s = settings()
+    project = project or s.get("project") or ""
+    try:
+        transcript, seconds = transcribe(wav, s, getattr(a, "language", None))
+    except LookupError as e:
+        info(str(e))
+        info("Audio kept: %s\nRetry later: meeting transcribe %s" % (wav, wav))
+        return 3
+    except (RuntimeError, OSError, ValueError, wave.Error) as e:
+        info("Transcription failed: %s" % e)
+        info("Audio kept: %s\nRetry later: meeting transcribe %s" % (wav, wav))
+        return 1
+    if not transcript:
+        info("No speech recognized. Audio kept: %s" % wav)
+        return 1
+    summary = None
+    model_note = ""
+    if getattr(a, "summarize", False):
+        summary = summarize(transcript, s)
+        model_note = "Summary by %s at %s. Machine-made, review before sharing." % (
+            s.get("summary_model") or "local model", s.get("summary_url", ""))
+    where = save_note(title, started, seconds, participants, project, transcript, summary, s, model_note)
+    print("Note saved: %s" % where)
+    managed = os.path.realpath(wav).startswith(os.path.realpath(os.path.join(state_dir(), "audio")) + os.sep)
+    if getattr(a, "keep_audio", False):
+        info("Audio kept: %s" % wav)
+    elif not managed:
+        info("Audio file kept (not recorded by `meeting`): delete it yourself if the policy says so.")
+    else:
+        for p in {wav, *_sibling_tracks(wav)}:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        info("Audio deleted.")
+    return 0
+
+
+def _sibling_tracks(wav):
+    base = os.path.basename(wav)
+    if not base.startswith("mixed-"):
+        return []
+    d = os.path.dirname(wav)
+    stem = base[len("mixed-"):-len("-mic.wav")] if base.endswith("-mic.wav") else None
+    if not stem:
+        return []
+    return [os.path.join(d, stem + "-mic.wav"), os.path.join(d, stem + "-system.wav")]
+
+
+def cmd_stop(a):
+    st = load_state()
+    if not st:
+        info("No recording.")
+        return 1
+    wav = finish_recording(st)
+    started = datetime.datetime.fromisoformat(st["started"])
+    try:
+        os.remove(state_path())
+    except OSError:
+        pass
+    if not wav:
+        info("No audio file was written, see %s" % os.path.join(state_dir(), "recorder.log"))
+        return 1
+    try:
+        secs = wav_seconds(wav)
+    except (OSError, wave.Error) as e:
+        info("The recording is not a readable WAV (%s). File: %s" % (e, wav))
+        return 1
+    info("Recorded %s." % stamp(secs))
+    if a.no_transcribe:
+        print("Audio: %s\nTranscribe later: meeting transcribe %s" % (wav, wav))
+        return 0
+    title = st["title"] or "Meeting %s" % started.strftime("%Y-%m-%d %H:%M")
+    return process_audio(wav, a, started, title, st["participants"], st["project"])
+
+
+def cmd_cancel(a):
+    st = load_state()
+    if not st:
+        info("No recording.")
+        return 1
+    _kill_recorders(st["recorders"])
+    try:
+        os.remove(state_path())
+    except OSError:
+        pass
+    info("Recording stopped and deleted.")
+    return 0
+
+
+def cmd_status(a):
+    st = load_state()
+    if recording_alive(st):
+        since = datetime.datetime.fromisoformat(st["started"])
+        print("recording since %s (%s)" % (st["started"], stamp((now() - since).total_seconds())))
+    else:
+        print("idle")
+    return 0
+
+
+def cmd_transcribe(a):
+    if not os.path.isfile(a.file):
+        info("No such file: %s" % a.file)
+        return 1
+    try:
+        wav_seconds(a.file)
+    except (OSError, wave.Error) as e:
+        info("%s is not a readable WAV (%s). Convert: ffmpeg -i in.m4a -ar 16000 -ac 1 out.wav" % (a.file, e))
+        return 1
+    started = datetime.datetime.fromtimestamp(os.path.getmtime(a.file)).replace(microsecond=0)
+    title = a.title or "Meeting %s" % started.strftime("%Y-%m-%d %H:%M")
+    return process_audio(os.path.abspath(a.file), a, started, title, a.participants or "", a.project)
+
+
+def cmd_engine(a):
+    s = settings()
+    rc = 0
+    url = s.get("whisper_url")
+    if url:
+        up = http_ok(url)
+        print("speech engine: configured server %s (%s)" % (url, "answers" if up else "NOT answering"))
+        rc |= 0 if up else 1
+    elif http_ok("http://127.0.0.1:8765"):
+        print("speech engine: 80-quassel server is running on 127.0.0.1:8765")
+    elif quassel_engine():
+        print("speech engine: 80-quassel found, `meeting` starts it on demand and stops it after")
+    else:
+        print(INSTALL_HINT)
+        rc = 1
+    rec = recorder_command("mic", "x.wav")
+    print("recorder: %s" % (rec[0] if rec else "NONE (install pw-record or parecord)"))
+    rc |= 0 if rec else 1
+    s_store = (s.get("store") or "auto").lower()
+    if s_store in ("auto", "brain") and brain_available():
+        print("note destination: brain (`brain new note`)")
+    else:
+        print("note destination: %s" % meetings_dir(s))
+    print("summary: %s" % (s.get("summary_url") or "off (set summary_url for a local model)"))
+    return rc
+
+
+def policy_path():
+    return os.path.join(conf_dir(), "meeting-ai-policy.md")
+
+
+def cmd_policy(a):
+    p = policy_path()
+    if not os.path.isfile(p):
+        info("Policy file missing: %s (run 17-meeting-capture/install.sh)" % p)
+        return 1
+    with open(p, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    if a.todo:
+        hits = [(i, ln.strip()) for i, ln in enumerate(lines, 1) if "TODO(ask IT)" in ln]
+        for i, ln in hits:
+            print("%s:%d: %s" % (p, i, ln))
+        print("%d open question(s) for IT" % len(hits))
+    else:
+        print("\n".join(lines))
+    return 0
+
+
+def cmd_purge(a):
+    s = settings()
+    days = a.days
+    if days is None and s.get("retention_days"):
+        try:
+            days = int(s["retention_days"])
+        except ValueError:
+            pass
+    if days is None:
+        info("No retention period set. Use --days N or retention_days=N in meeting.conf\n"
+             "(the value is a TODO(ask IT) in the policy).")
+        return 1
+    cutoff = time.time() - days * 86400
+    removed = 0
+    roots = [os.path.join(state_dir(), "audio"), meetings_dir(s)]
+    cur = load_state()
+    active = {r["out"] for r in cur["recorders"]} if recording_alive(cur) else set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            p = os.path.join(root, name)
+            if p in active or not os.path.isfile(p):
+                continue
+            if not (name.endswith(".wav") or name.endswith(".md")):
+                continue
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                removed += 1
+                print("deleted %s" % p)
+    print("%d file(s) older than %d days deleted. Notes in the brain are not touched: delete "
+          "them there if the policy requires." % (removed, days))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="meeting", description=__doc__.strip().splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add_meta(p):
+        p.add_argument("--title", help="meeting title")
+        p.add_argument("--project", help="brain project slug")
+        p.add_argument("--participants", help="names, for the note")
+
+    p = sub.add_parser("start", help="consent reminder, then record in the background")
+    add_meta(p)
+    p.add_argument("--source", choices=["mic", "system", "both"], default="mic",
+                   help="mic (default), system (what the laptop plays), both")
+    p.add_argument("--consent-given", action="store_true",
+                   help="skip the question (for scripts); the reminder is still shown")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("stop", help="stop, transcribe, write the note")
+    p.add_argument("--keep-audio", action="store_true")
+    p.add_argument("--no-transcribe", action="store_true")
+    p.add_argument("--summarize", action="store_true", help="summary from the configured local model")
+    p.add_argument("--language", help="whisper language code, default: auto")
+    p.set_defaults(fn=cmd_stop)
+
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("cancel", help="stop and delete the recording").set_defaults(fn=cmd_cancel)
+
+    p = sub.add_parser("transcribe", help="transcribe an existing 16 kHz mono WAV")
+    p.add_argument("file")
+    add_meta(p)
+    p.add_argument("--keep-audio", action="store_true")
+    p.add_argument("--summarize", action="store_true")
+    p.add_argument("--language")
+    p.set_defaults(fn=cmd_transcribe)
+
+    sub.add_parser("engine", help="check speech engine, recorder, note destination").set_defaults(fn=cmd_engine)
+    p = sub.add_parser("policy", help="show the meeting AI policy")
+    p.add_argument("--todo", action="store_true", help="only the TODO(ask IT) lines")
+    p.set_defaults(fn=cmd_policy)
+    p = sub.add_parser("purge", help="delete old audio and old notes in ~/work/meetings/")
+    p.add_argument("--days", type=int)
+    p.set_defaults(fn=cmd_purge)
+
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a)
+    except KeyboardInterrupt:
+        info("Interrupted. A background recording keeps running: `meeting stop` or `meeting cancel`.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

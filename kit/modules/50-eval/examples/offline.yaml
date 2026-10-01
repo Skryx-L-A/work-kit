@@ -1,0 +1,39 @@
+# Runs fully offline: the "providers" are plain shell commands.
+name: offline-demo
+description: Shows every provider input mode and most graders without any model or network.
+repetitions: 2
+timeout: 10
+
+providers:
+  - id: echo-stdin        # no {input} in the command, so the prompt is piped to stdin
+    type: shell
+    command: cat
+  - id: printf-arg        # {input} is replaced by the shell-quoted prompt
+    type: shell
+    command: "printf '%s\\n' {input}"
+
+cases:
+  - id: repeat-back
+    input: "Hello evalkit"
+    graders:
+      - {type: contains, value: "evalkit", ignore_case: true}
+      - {type: regex, pattern: "^hello", flags: i}
+  - id: exact-echo
+    input: "42"
+    graders:
+      - {type: exact, value: "42"}
+      - {type: numeric, expected: 42}
+  - id: json-reply
+    input: '{"name": "Ada", "age": 36}'
+    graders:
+      - type: json-schema
+        schema:
+          type: object
+          required: [name, age]
+          properties:
+            name: {type: string}
+            age: {type: integer, minimum: 0}
+  - id: script-check
+    input: "one two three"
+    graders:
+      - {type: script, command: "{python} check_words.py"}

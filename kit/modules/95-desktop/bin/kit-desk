@@ -1,0 +1,732 @@
+#!/usr/bin/env bash
+# kit-desk: helper behind the Omarchy-like GNOME shortcuts of work-kit (module 95-desktop).
+#   kit-desk term [--tmux] [-e CMD ARGS...]   open a terminal (Ghostty, Ghostty with software OpenGL,
+#                                             Alacritty, then the desktop's own)
+#   kit-desk browser [--private] [URL]        open the default browser in a new window
+#   kit-desk editor [FILE]                    nvim in a terminal ($KIT_DESK_EDITOR overrides)
+#   kit-desk files                            file manager (Files on GNOME, Dolphin on KDE)
+#   kit-desk keys [--window] [--width N]      show the keyboard shortcuts (Super+K); --width wraps the
+#                                             texts at word boundaries (default: the terminal's width)
+#   kit-desk menu                             kit menu: apps, settings, keys, theme, system (Super+Alt+Space)
+#   kit-desk power                            system menu: lock, suspend, log out, restart, power off
+#   kit-desk settings [PANEL]                 GNOME Settings (sound, bluetooth, network, display, power)
+#   kit-desk emoji                            emoji picker; the emoji goes to the clipboard
+#   kit-desk welcome                          first-login welcome (runs once from autostart)
+#   kit-desk theme [NAME] [--list] [--keep-wallpaper]   apply a colour theme (menu without NAME)
+#   kit-desk finish-login [--force]           apply the desktop changes that waited for the next login
+#                                             (runs from autostart; safe to run again by hand)
+#   kit-desk status                           GNOME version, extensions, pending changes, locked keys, theme
+set -euo pipefail
+
+usage() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "${BASH_SOURCE[0]}"; }
+# help acts on nothing: checked before anything is read or written, for every subcommand
+case "${1:-help}" in help|-h|--help) usage; exit 0 ;; esac
+for a in "$@"; do case "$a" in -h|--help) usage; exit 0 ;; esac; done
+
+KIT_DATA="${KIT_DATA_DIR:-$HOME/.local/share/work-kit}"
+SHARE="${KIT_DESK_SHARE:-$KIT_DATA/desktop/share}"
+[ -f "$SHARE/lib/desk.sh" ] || { echo "kit-desk: $SHARE missing, run 95-desktop/install.sh" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$SHARE/lib/desk.sh"
+# shellcheck source=/dev/null
+[ -f "$SHARE/lib/kde.sh" ] && . "$SHARE/lib/kde.sh"
+conf_get() { sed -n "s/^$1=//p" "$DESK_STATE/install.conf" 2>/dev/null | head -n 1 || true; }
+DESKTOP="$(conf_get desktop)"; DESKTOP="${DESKTOP:-gnome}"
+PLASMA="${DESK_KDE:-$(conf_get plasma)}"
+[ -n "${DESK_KDE:-}" ] && DESKTOP=kde
+if [ "$DESKTOP" = kde ] && [ -n "$PLASMA" ]; then kde_tools; fi
+
+# missing <title> <text>: a launch key found nothing to start. Say so on screen (a key that does
+# nothing looks broken) and on stderr, and fail.
+missing() {
+  echo "kit-desk: $1. $2" >&2
+  if have notify-send; then notify-send -a "Work kit" "$1" "$2" 2>/dev/null || true; fi
+  return 1
+}
+
+term_cmd() { # prints the terminal launcher words, one per line, ending with the "execute" flag
+  # a Ghostty that failed to start (no OpenGL 4.3 even with the kit's software OpenGL, broken AppImage)
+  # is skipped until reinstall
+  if [ ! -f "$DESK_STATE/ghostty-broken" ] && have ghostty; then printf '%s\n' ghostty -e
+  elif [ ! -f "$DESK_STATE/ghostty-broken" ] && [ -x "$BIN_DIR/ghostty" ]; then printf '%s\n' "$BIN_DIR/ghostty" -e
+  elif have alacritty; then printf '%s\n' alacritty -e
+  elif [ "$DESKTOP" = kde ] && have konsole; then printf '%s\n' konsole -e
+  elif have ptyxis; then printf '%s\n' ptyxis --new-window --
+  elif have kgx; then printf '%s\n' kgx --
+  elif have gnome-terminal; then printf '%s\n' gnome-terminal --
+  elif have konsole; then printf '%s\n' konsole -e
+  elif have x-terminal-emulator; then printf '%s\n' x-terminal-emulator -e
+  else missing "No terminal installed" "Neither Ghostty, Alacritty nor the desktop's terminal was found. Ask IT."; fi
+}
+
+cmd_term() {
+  local words=() w tmux=0 list
+  list="$(term_cmd)" || return 1
+  while IFS= read -r w; do words+=("$w"); done <<<"$list"
+  [ "${1:-}" = --tmux ] && { tmux=1; shift; }
+  if [ "$tmux" = 1 ]; then
+    if have tmux; then set -- -e tmux new-session -A -s main
+    elif have zellij; then set -- -e zellij
+    fi
+  fi
+  if [ "${1:-}" = -e ]; then
+    shift
+    # a missing program would open a terminal that closes at once
+    if [ -n "${1:-}" ] && ! have "$1" && [ ! -x "$BIN_DIR/$1" ]; then
+      missing "$1 is not installed" "The kit could not start $1. Reinstall the module that brings it or ask IT."; return 1
+    fi
+    [ -n "${1:-}" ] && ! have "$1" && set -- "$BIN_DIR/$1" "${@:2}"
+    set -- "${words[@]}" "$@"
+  else
+    # launcher without a command: drop the trailing execute flag
+    unset 'words[${#words[@]}-1]'
+    set -- "${words[@]}"
+  fi
+  case "$1" in
+    *ghostty) ;;
+    *) exec "$@" ;;
+  esac
+  # Ghostty: when it fails to open its window, mark it broken and open the next terminal, so
+  # Super+Return never leaves the user without a terminal. Ghostty 1.3 needs OpenGL 4.3; without
+  # it (no GPU, old driver, VM) it logs "OpenGL version is too old" and exits with status 0. On a
+  # slow machine that message came 56 s after the start, so there is no fixed time limit: watch the
+  # log until it reports the renderer (OpenGL 4.3 or newer, plus 2 s without an error) or an error.
+  local pid n=0 ok_at=-1 rc=0 elog failed=0
+  local bad='OpenGL(Outdated| version is too old)|SurfaceError|failed to initialize surface'
+  elog="$(mktemp "${TMPDIR:-/tmp}/kit-desk-ghostty.XXXXXX")"
+  "$@" 2> >(tee "$elog" >&2) & pid=$!
+  while [ "$n" -lt "${KIT_DESK_GHOSTTY_WAIT:-1800}" ]; do
+    if grep -qE "$bad" "$elog" 2>/dev/null; then failed=1; kill "$pid" 2>/dev/null || true; break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    if [ "$ok_at" -lt 0 ] && grep -qE 'loaded OpenGL ([4-9]\.([3-9]|[1-9][0-9])|[5-9]\.|[1-9][0-9]\.)' "$elog" 2>/dev/null; then ok_at=$n; fi
+    if [ "$ok_at" -ge 0 ] && [ $((n - ok_at)) -ge 20 ]; then break; fi
+    sleep 0.1; n=$((n + 1))
+  done
+  if [ "$failed" = 0 ] && kill -0 "$pid" 2>/dev/null; then rm -f "$elog"; wait "$pid" || true; return 0; fi
+  wait "$pid" || rc=$?
+  sleep 0.2 # let tee finish the log
+  if [ "$failed" = 0 ] && [ "$rc" = 0 ] && ! grep -qE "$bad" "$elog"; then
+    rm -f "$elog"; return 0
+  fi
+  mkdir -p "$DESK_STATE"
+  # the kit's Ghostty without a GPU that gives OpenGL 4.3: once more with the shipped software OpenGL
+  # (llvmpipe, install.sh), and from then on always (the ghostty wrapper reads state/ghostty-sw)
+  if [ ! -f "$DESK_STATE/ghostty-sw" ] && [ -d "$DESK_DATA/apps/ghostty-gl" ] &&
+     grep -qE 'OpenGL' "$elog" && [ "$(command -v "$1" 2>/dev/null)" = "$BIN_DIR/ghostty" ]; then
+    { echo "exit $rc $(date +%F)"; grep -E 'OpenGL' "$elog" | head -n 3; } >"$DESK_STATE/ghostty-sw"
+    rm -f "$elog"
+    echo "kit-desk: Ghostty found no OpenGL 4.3, starting it with the kit's software OpenGL (llvmpipe) from now on" >&2
+    shift
+    [ "${1:-}" = -e ] && shift
+    if [ "$#" -gt 0 ]; then cmd_term -e "$@"; else cmd_term; fi
+    return
+  fi
+  { echo "exit $rc $(date +%F)"; grep -E 'error|OpenGL' "$elog" | head -n 5; } >"$DESK_STATE/ghostty-broken"
+  rm -f "$elog"
+  echo "kit-desk: Ghostty failed (exit $rc, see $DESK_STATE/ghostty-broken), using the next terminal from now on" >&2
+  shift
+  [ "${1:-}" = -e ] && shift
+  if [ "$#" -gt 0 ]; then cmd_term -e "$@"; else cmd_term; fi
+}
+
+cmd_browser() {
+  local private=0 desk exe
+  [ "${1:-}" = --private ] && { private=1; shift; }
+  desk="$(xdg-settings get default-web-browser 2>/dev/null || true)"
+  for exe in "${desk%.desktop}" google-chrome microsoft-edge chromium chromium-browser brave-browser firefox; do
+    if [ -z "$exe" ] || ! have "$exe"; then continue; fi
+    case "$exe" in
+      firefox*) if [ "$private" = 1 ]; then exec "$exe" --private-window "$@"; else exec "$exe" --new-window "$@"; fi ;;
+      microsoft-edge*) if [ "$private" = 1 ]; then exec "$exe" --inprivate "$@"; else exec "$exe" --new-window "$@"; fi ;;
+      *) if [ "$private" = 1 ]; then exec "$exe" --incognito "$@"; else exec "$exe" --new-window "$@"; fi ;;
+    esac
+  done
+  [ -n "$desk" ] && have gtk-launch && exec gtk-launch "$desk" "$@"
+  missing "No web browser installed" "Neither Chrome, Edge, Chromium, Brave nor Firefox was found. Ask IT to install one."
+}
+
+cmd_editor() {
+  local ed="${KIT_DESK_EDITOR:-nvim}"
+  have "$ed" || [ -x "$BIN_DIR/$ed" ] || ed="${EDITOR:-nano}"
+  have "$ed" || [ -x "$BIN_DIR/$ed" ] || { missing "No text editor installed" "Neither nvim nor ${EDITOR:-nano} was found. Reinstall 95-desktop or ask IT."; return 1; }
+  cmd_term -e "$ed" "$@"
+}
+
+# tiler_action <tiler> <key> <action>: the GNOME table is written for Tiling Shell; PaperWM and
+# Tactile do some of these keys differently (install.sh maps them)
+tiler_action() {
+  case "$1:$2" in
+    kit:"SUPER + T") echo "Toggle floating (again: back into the tiles)" ;;
+    kit:"SUPER + L") echo "Next layout: main left / main on top" ;;
+    kit:"SUPER + CTRL + F") echo "Monocle: every window fills the screen (again: back)" ;;
+    kit:"SUPER + SHIFT + "*) echo "$3 (at the edge: to the next monitor)" ;;
+    paperwm:"SUPER + T") echo "Toggle floating (PaperWM scratch layer)" ;;
+    paperwm:"SUPER + L") echo "PaperWM has no layouts: Super+R cycles the width" ;;
+    paperwm:"SUPER + CTRL + F") echo "PaperWM: Super+Alt+F full width" ;;
+    paperwm:"SUPER + SHIFT + "*) echo "$3 (PaperWM: move the column)" ;;
+    tactile:"SUPER + T") echo "Tactile grid, then two keys (q..m) place the window" ;;
+    tactile:"SUPER + LEFT"|tactile:"SUPER + RIGHT") echo "Half screen (GNOME)" ;;
+    tactile:"SUPER + UP") echo "Maximize (GNOME)" ;;
+    tactile:"SUPER + DOWN") echo "Restore size (GNOME)" ;;
+    tactile:*) echo "$3 (not with Tactile)" ;;
+    forge:"SUPER + T") echo "Toggle floating (Forge)" ;;
+    forge:"SUPER + L") echo "Toggle split direction of the focused container (Forge; Super+J too)" ;;
+    forge:"SUPER + CTRL + F") echo "Tabbed layout: one window visible (Forge; again: back)" ;;
+    *) echo "$3" ;;
+  esac
+}
+
+# key_label <key> <layout>: the table names keys as on a German keyboard where the layouts differ;
+# PLUS is the key right of 0 on US keyboards ("=", its shifted "+"), so it is shown as EQUAL there
+key_label() {
+  case "$2" in de) printf '%s' "$1" ;; *) printf '%s' "${1//PLUS/EQUAL}" ;; esac
+}
+
+# fmt_table <width>: "key<TAB>text" lines become a table with a 30-column key column; the texts wrap
+# at word boundaries with a hanging indent. Other lines wrap at word boundaries. Width 0: no wrapping.
+fmt_table() {
+  awk -F'\t' -v W="${1:-0}" '
+    function out(first, text, ind,   n, i, w, line, avail) {
+      if (W < ind + 20) { print first text; return }
+      avail = W - ind; n = split(text, w, " "); line = ""
+      for (i = 1; i <= n; i++) {
+        if (line == "") line = w[i]
+        else if (length(line) + 1 + length(w[i]) <= avail) line = line " " w[i]
+        else { print first line; first = sprintf("%" ind "s", ""); line = w[i] }
+      }
+      print first line
+    }
+    NF >= 2 && W > 0 && length($1) > 30 { print $1; out(sprintf("%31s", ""), $2, 31); next }
+    NF >= 2 { out(sprintf("%-30s ", $1), $2, 31); next }
+    { if (W == 0 || $0 == "") print; else out("", $0, 0) }'
+}
+
+# the key list in its own terminal window (Super+K). A new window is tiled a moment after it opens:
+# wait until the terminal size holds still, then wrap the list to that width.
+keys_pager() {
+  local c="" prev="" same=0 n=0
+  while [ "$n" -lt 40 ]; do
+    c="$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)"
+    if [ -n "$c" ] && [ "$c" = "$prev" ]; then same=$((same + 1)); else same=0; fi
+    [ "$same" -ge 6 ] && break
+    prev="$c"; sleep 0.1; n=$((n + 1))
+  done
+  cmd_keys --width "${c:-0}" | less -R -P 'Keys  (/ search, q close)'
+}
+
+cmd_keys() {
+  if [ "${1:-}" = --window ]; then
+    cmd_term -e "$0" keys --pager
+    return
+  fi
+  if [ "${1:-}" = --pager ]; then keys_pager; return; fi
+  local width=0
+  if [ "${1:-}" = --width ]; then width="${2:-0}"; case "$width" in ''|*[!0-9]*) width=0 ;; esac
+  elif [ -t 1 ]; then width="$(tput cols 2>/dev/null || echo 0)"; fi
+  keys_table | fmt_table "$width"
+}
+
+keys_table() {
+  local key action spec kind target tiler tname clip ws kb super table="$SHARE/keys.tsv"
+  tiler="$(conf_get tiler_active)"; clip="$(conf_get clipboard)"; ws="$(conf_get workspaces)"; tname="$(conf_get tiler)"
+  super="$(conf_get superkey)"
+  [ "$DESKTOP" = kde ] && table="$SHARE/keys-kde.tsv"
+  kb="$(kb_layout "$DESKTOP")"
+  echo "Keyboard shortcuts (Super = Windows key). Super+K shows this list again."
+  [ "$kb" = de ] && echo "German keyboard layout: PLUS is the + key right of Ü, MINUS the - key right of the full stop."
+  echo
+  printf '%s\t%s\n' "Key" "Action"
+  printf '%s\t%s\n' "---" "------"
+  grep -v '^#' "$table" | while IFS='|' read -r key action spec; do
+    [ -n "$key" ] || continue
+    kind="${spec%%:*}"
+    case "$kind" in
+      none) # Forge (GNOME 42-44) has these Omarchy keys
+        if [ "$tiler:$tname:$key" = "1:forge:SUPER + J" ]; then action="Toggle split direction (Forge)"
+        elif [ "$tiler:$tname:$key" = "1:forge:SUPER + G" ]; then action="Tabbed group of windows (Forge; again: back)"
+        else continue; fi ;;
+      kit) if [ "$tiler:$tname" = 1:forge ]; then action="$action (Forge: the window's right edge)"
+           elif [ "$tiler" != 1 ] || [ "$tname" != kit ]; then action="$action (kit tiler only)"; fi ;;
+      tiler|tile) if [ "$tiler" != 1 ]; then action="$action (no tiler active)"
+                  else action="$(tiler_action "$tname" "$key" "$action")"; fi ;;
+      clip) [ "$clip" = 1 ] || action="$action (extension off)" ;;
+      super) [ "$super" = off ] && continue ;; # Super alone does nothing (install default)
+    esac
+    case "$key" in *" + DIGIT") key="${key% + DIGIT} + 1..${ws:-6}" ;; esac
+    key="$(key_label "$key" "$kb")"
+    action="${action//DIGIT/1..${ws:-6}}"
+    printf '%s\t%s\n' "$key" "$action"
+  done
+  echo
+  echo "Omarchy keys without a counterpart here:"
+  grep -v '^#' "$table" | while IFS='|' read -r key action spec; do
+    kind="${spec%%:*}"; target="${spec#*:}"
+    [ "$kind" = none ] || continue
+    case "$(conf_get tiler):$key" in "forge:SUPER + J"|"forge:SUPER + G") continue ;; esac
+    printf '%s\t%s: %s\n' "$(key_label "$key" "$kb")" "${action//DIGIT/N}" "$target"
+  done
+  echo
+  if [ "$DESKTOP" = kde ]; then
+    if [ "$super" = off ]; then echo "Stuck? Super+Space opens the launcher (KRunner), Alt+F2 runs a command,"
+    else echo "Stuck? Super alone opens the launcher menu, Alt+F2 runs a command,"; fi
+    echo "Ctrl+Alt+Delete logs out. Undo everything: bash ~/work/kit/modules/95-desktop/uninstall.sh"
+    return 0
+  fi
+  if [ "$super" = off ]; then echo "Stuck? Super+Space opens the launcher (type to search apps), Alt+F2 runs a command,"
+  else echo "Stuck? Super alone opens the overview (type to search apps), Alt+F2 runs a command,"; fi
+  echo "Ctrl+Alt+Delete logs out. Undo everything: bash ~/work/kit/modules/95-desktop/uninstall.sh"
+}
+
+# pick TITLE ITEM...: prints the chosen item; zenity when there is a display, else a numbered list
+pick() {
+  local title="$1" i=0 n item
+  shift
+  if [ -z "${KIT_DESK_TTY:-}" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    if have zenity; then
+      zenity --list --title="$title" --text="Enter opens, Esc closes." --column=Action --hide-header \
+        --width=360 --height=$(( (250 + 36 * $#) < 740 ? 250 + 36 * $# : 740 )) "$@" 2>/dev/null
+      return
+    elif have kdialog; then
+      local args=()
+      for item in "$@"; do args+=("$item" "$item"); done
+      kdialog --title "$title" --menu "$title" "${args[@]}" 2>/dev/null
+      return
+    fi
+  fi
+  echo "$title" >&2
+  for item in "$@"; do i=$((i + 1)); printf '  %d) %s\n' "$i" "$item" >&2; done
+  printf 'Number (Enter cancels): ' >&2
+  read -r n || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -ge 1 ] && [ "$n" -le "$#" ] || return 1
+  shift $((n - 1)); printf '%s\n' "$1"
+}
+
+in_menu_terminal() { # without zenity and without a tty, re-run the menu inside a terminal
+  if [ -n "${KIT_DESK_TTY:-}" ] || [ -t 0 ] || { { have zenity || have kdialog; } && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }; then return 1; fi
+  KIT_DESK_TTY=1 cmd_term -e "$0" "$@"
+}
+
+cmd_power() {
+  in_menu_terminal power && return 0
+  local c
+  c="$(pick "System" "Lock" "Suspend" "Log out" "Restart" "Power off")" || return 0
+  if [ "$DESKTOP" = kde ] && [ -n "${QDB:-}" ]; then
+    # Plasma 6: org.kde.Shutdown; Plasma 5: ksmserver logout(confirm, type 0/1/2 = logout/reboot/halt, mode)
+    case "$c" in
+      "Log out") "$QDB" org.kde.Shutdown /Shutdown logout 2>/dev/null || "$QDB" org.kde.ksmserver /KSMServer logout 0 0 0; return ;;
+      Restart) "$QDB" org.kde.Shutdown /Shutdown logoutAndReboot 2>/dev/null || "$QDB" org.kde.ksmserver /KSMServer logout 0 1 0; return ;;
+      "Power off") "$QDB" org.kde.Shutdown /Shutdown logoutAndShutdown 2>/dev/null || "$QDB" org.kde.ksmserver /KSMServer logout 0 2 0; return ;;
+    esac
+  fi
+  case "$c" in
+    Lock) loginctl lock-session 2>/dev/null || xdg-screensaver lock ;;
+    Suspend) systemctl suspend ;;
+    "Log out") gnome-session-quit --logout --no-prompt 2>/dev/null || loginctl terminate-session "${XDG_SESSION_ID:-}" ;;
+    Restart) gnome-session-quit --reboot 2>/dev/null || systemctl reboot ;;
+    "Power off") gnome-session-quit --power-off 2>/dev/null || systemctl poweroff ;;
+  esac
+}
+
+cmd_settings() {
+  local panel="${1:-}"
+  if [ "$panel" = network ] && have nmcli && nmcli -t -f TYPE device 2>/dev/null | grep -qx wifi; then panel=wifi; fi
+  if [ "$DESKTOP" != kde ] && have gnome-control-center; then
+    if [ -n "$panel" ]; then exec gnome-control-center "$panel"; else exec gnome-control-center; fi
+  fi
+  local kcm="" k
+  case "$panel" in
+    sound) kcm=kcm_pulseaudio ;; bluetooth) kcm=kcm_bluetooth ;; network|wifi) kcm=kcm_networkmanagement ;;
+    display) kcm=kcm_kscreen ;; power) kcm=kcm_powerdevilprofilesconfig ;;
+  esac
+  for k in kcmshell6 kcmshell5; do
+    if [ -z "$kcm" ] || ! have "$k"; then continue; fi
+    # a module that is not installed makes kcmshell exit at once: then open System Settings
+    local pid n=0
+    "$k" "$kcm" & pid=$!
+    while [ "$n" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then wait "$pid" || true; return 0; fi
+    break
+  done
+  # System Settings opens a module given by name (Plasma 6 without kcmshell6, found in the VM);
+  # an unknown name shows its start page
+  if have systemsettings; then if [ -n "$kcm" ]; then exec systemsettings "$kcm"; else exec systemsettings; fi; fi
+  if have systemsettings5; then if [ -n "$kcm" ]; then exec systemsettings5 "$kcm"; else exec systemsettings5; fi; fi
+  echo "kit-desk: no settings app found" >&2; return 1
+}
+
+cmd_files() {
+  if have nautilus; then exec nautilus --new-window "$@"; fi
+  if have dolphin; then exec dolphin --new-window "$@"; fi
+  if have xdg-open && xdg-open "${1:-$HOME}" 2>/dev/null; then return 0; fi
+  missing "No file manager installed" "Neither Files (nautilus) nor Dolphin was found. Ask IT."
+}
+
+cmd_emoji() {
+  # IBus (on every Ubuntu desktop) has a searchable emoji window that copies the choice
+  if [ "$DESKTOP" = kde ] && have plasma-emojier; then exec plasma-emojier; fi
+  if have ibus && ibus emoji 2>/dev/null; then return 0; fi
+  if have gnome-characters; then exec gnome-characters; fi
+  have notify-send && notify-send -a "Work kit" "Emoji" "In GTK text fields press Ctrl+. (or Ctrl+;)"
+}
+
+cmd_menu() {
+  in_menu_terminal menu && return 0
+  local c
+  c="$(pick "Kit menu" "Keyboard shortcuts" "Terminal" "Browser" "Files" "Editor (nvim)" \
+    "Settings" "Sound" "Network" "Bluetooth" "Display" "Theme" "Activity (btop)" "System (lock, log out, power)")" || return 0
+  case "$c" in
+    "Keyboard shortcuts") cmd_keys --window ;;
+    Terminal) cmd_term ;;
+    Browser) cmd_browser ;;
+    Files) cmd_files ;;
+    "Editor (nvim)") cmd_editor ;;
+    Settings) cmd_settings ;;
+    Sound) cmd_settings sound ;;
+    Network) cmd_settings network ;;
+    Bluetooth) cmd_settings bluetooth ;;
+    Display) cmd_settings display ;;
+    Theme) cmd_term -e "$0" theme ;;
+    "Activity (btop)") cmd_term -e btop ;;
+    System*) cmd_power ;;
+  esac
+}
+
+cmd_kde_keys() { # from the Plasma login hook, once per install and keyboard layout: write the Omarchy keys
+  local f="$DESK_STATE/kde-keys-applied" kb
+  [ "$DESKTOP" = kde ] && [ -n "$PLASMA" ] || return 0
+  kb="$(kb_layout kde)"
+  # "date layout"; a file without a layout was written with the US keys
+  if [ -f "$f" ]; then case "$(cat "$f")" in *" de") [ "$kb" = de ] && return 0 ;; *) [ "$kb" != de ] && return 0 ;; esac; fi
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  KEYS_KDE="$SHARE/keys-kde.tsv" kde_apply_keys keys "$(conf_get workspaces)"
+  printf '%s %s\n' "$(date +%F)" "$kb" >"$f"
+}
+
+cmd_welcome() { # once per install, from ~/.config/autostart
+  [ -f "$DESK_STATE/welcome-shown" ] && return 0
+  mkdir -p "$DESK_STATE"; date +%F >"$DESK_STATE/welcome-shown"
+  if have notify-send; then
+    notify-send -a "Work kit" "Desktop ready" "Super+K: all shortcuts. Super+Space: apps. Super+Return: terminal. Super+Escape: lock, log out, power off." || true
+  fi
+  cmd_keys --window
+}
+
+# GNOME on Wayland loads new extensions only at login, so install.sh queues the changes that belong
+# to them (dock off, tiler keys, ...) in pending-login.tsv and runs this from ~/.config/autostart.
+# Unless --force, it applies them only when the extension they wait for really runs (the dock stays otherwise:
+# a desktop without dock and without tiler is the half-converted state this exists to avoid).
+# A login run must never stop half-way: no set -e here, every step checks its own result and writes
+# to finish-login.log. The autostart entry stays until the queue is applied, so the next login tries
+# again. Found in the GNOME 46 VM walkthrough: early in the login `gnome-extensions info` failed, set -e
+# ended the script without a word, and the queue and the entry stayed (dock and Super+arrows as before).
+FL_LOG="$DESK_STATE/finish-login.log"
+fl_log() { # to the log; by hand also to the terminal
+  mkdir -p "$DESK_STATE" 2>/dev/null
+  printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$FL_LOG" 2>/dev/null
+  [ "${FL_QUIET:-0}" = 1 ] || printf 'finish-login: %s\n' "$*" >&2
+  return 0
+}
+ext_state() { # state of an extension in the running shell (ACTIVE, INACTIVE, ERROR, ...), empty when unknown
+  have gnome-extensions || return 0
+  { gnome-extensions info "$1" 2>/dev/null || true; } | sed -n 's/^ *State: *//p' | head -n 1
+  return 0
+}
+# fl_apply_line <op> <path> <value>: 0 when the change holds afterwards, 1 when it failed, 2 when locked
+fl_apply_line() {
+  local op="$1" path="$2" value="$3" items
+  if ! kd_writable "$path"; then return 2; fi
+  case "$op" in
+    write) kd_write "$path" "$value" >/dev/null 2>&1 || return 1 ;;
+    add) kd_list_add "$path" "$value" >/dev/null 2>&1 || true
+         items="$(gv_items "$(kd_effective "$path")")"
+         printf '%s\n' "$items" | grep -qxF "$value" || return 1 ;;
+    remove) kd_list_remove "$path" "$value" >/dev/null 2>&1 || true
+            items="$(gv_items "$(kd_effective "$path")")"
+            printf '%s\n' "$items" | grep -qxF "$value" && return 1 ;;
+    *) return 0 ;;
+  esac
+  return 0
+}
+cmd_finish_login() {
+  set +e
+  local force=0 login=0 wait uuid st="" last="-" n=0 t0=$SECONDS op path value applied=0 failed=0 locked=0 f="$DESK_STATE/install.conf" tmp rc
+  local lock="$DESK_STATE/finish-login.lock"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --force) force=1 ;; --login) login=1 ;; esac
+    shift
+  done
+  # at the login: quiet, and a generous wait (a slow machine loads the extensions late); by hand: short
+  [ "$login" = 1 ] && FL_QUIET=1
+  wait="${KIT_DESK_FINISH_WAIT:-}"
+  [ -n "$wait" ] || { if [ "$login" = 1 ]; then wait=300; else wait=30; fi; }
+  if [ ! -s "$PENDING" ]; then
+    rm -f "$PENDING" "$FINISH_AUTOSTART"
+    [ "$login" = 1 ] || echo "finish-login: nothing pending"
+    return 0
+  fi
+  mkdir -p "$DESK_STATE"
+  # one run at a time (autostart and a run by hand); a lock older than 15 minutes is stale
+  if ! mkdir "$lock" 2>/dev/null; then
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then rm -rf "$lock"; mkdir "$lock" 2>/dev/null
+    else fl_log "another finish-login is running (lock $lock), nothing done"; return 0; fi
+  fi
+  trap 'rm -rf "'"$lock"'"' EXIT
+  fl_log "start ($([ "$login" = 1 ] && echo login || echo by hand)$([ "$force" = 1 ] && echo ', --force')): $(wc -l <"$PENDING" | tr -d ' ') queued change(s), session ${XDG_SESSION_TYPE:-unknown}"
+  uuid="$(conf_get defer_anchor)"
+  if [ "$force" = 0 ] && [ -n "$uuid" ]; then
+    if ! have gnome-extensions; then
+      fl_log "gnome-extensions not found: cannot see whether $uuid runs"
+    else
+      # the shell loads the extensions a while after the session starts: wait for the anchor
+      while :; do
+        n=$((SECONDS - t0))
+        st="$(ext_state "$uuid")"
+        [ "$st" = "$last" ] || { fl_log "$uuid state after ${n}s: ${st:-unknown (shell not answering or extension not loaded yet)}"; last="$st"; }
+        case "$st" in ACTIVE|ENABLED) break ;; ERROR*|OUT*) [ "$n" -ge 10 ] && break ;; esac
+        [ "$n" -ge "$wait" ] && break
+        sleep 1
+      done
+    fi
+    case "$st" in
+      ACTIVE|ENABLED) ;;
+      *)
+        fl_log "$uuid is not running (state: ${st:-unknown}) after ${n}s: the queue stays, the dock stays on"
+        printf '%s\n' "finish-login: $uuid state ${st:-unknown} on $(date +%F): changes not applied (log: $FL_LOG)" >>"$REPORT"
+        if [ "$login" = 1 ]; then
+          have notify-send && notify-send -a "Work kit" "Desktop setup not finished" "$uuid did not load. Details: kit-desk status. Try again: kit-desk finish-login" || true
+        else
+          printf '%s\n' "finish-login: $uuid is not running (state: ${st:-unknown}); the pending changes stay queued and the dock stays on." \
+            "Run this inside the desktop session. Fix the extension (gnome-extensions info $uuid), then run: kit-desk finish-login   (--force applies them anyway)" >&2
+        fi
+        return 1 ;;
+    esac
+  fi
+  desk_init_state
+  : >"$DESK_STATE/pending-left.tsv"
+  while IFS="$TAB" read -r op path value; do
+    [ -n "$path" ] || continue
+    fl_apply_line "$op" "$path" "$value"; rc=$?
+    case "$rc" in
+      0) applied=$((applied + 1)) ;;
+      2) locked=$((locked + 1)); fl_log "locked by policy, left as it is: $op $path $value" ;;
+      *) failed=$((failed + 1)); fl_log "FAILED: $op $path $value"; printf '%s\t%s\t%s\n' "$op" "$path" "$value" >>"$DESK_STATE/pending-left.tsv" ;;
+    esac
+  done <"$PENDING"
+  fl_log "applied $applied, failed $failed, locked $locked"
+  # Extensions switched off above (Ubuntu's Tiling Assistant, the dock) put back the keys they had
+  # taken over when they stop, after the writes above (GNOME 50 VM: Super+arrows went back to GNOME's
+  # half tiling). Wait until they stopped, then write the queued values once more.
+  local off="" u busy
+  off="$(awk -F'\t' '$1=="add" && $2 ~ /disabled-extensions$/ {print $3}' "$PENDING")"
+  if [ -n "$off" ] && have gnome-extensions; then
+    n=0
+    while [ "$n" -lt 20 ]; do
+      busy=""
+      for u in $off; do [ "$(ext_state "$u")" = ACTIVE ] && busy="$busy $u"; done
+      [ -z "$busy" ] && break
+      sleep 0.5; n=$((n + 1))
+    done
+    [ -z "$busy" ] || fl_log "still running 10 s after the disable:$busy (they stop at the next login at the latest)"
+    for u in $off; do fl_log "$u now: $(ext_state "$u")"; done
+    sleep 1
+    while IFS="$TAB" read -r op path value; do
+      [ "$op" = write ] && [ -n "$path" ] && { kd_write "$path" "$value" >/dev/null 2>&1 || true; }
+    done <"$PENDING"
+    # Ubuntu Dock puts GNOME's overview dash back when it stops, after Just Perfection hid it at the
+    # login (GNOME 46 VM): Just Perfection hides it again when its setting changes
+    local jp=/org/gnome/shell/extensions/just-perfection/dash
+    # shellcheck disable=SC2086  # one uuid per word
+    if printf '%s\n' $off | grep -qx ubuntu-dock@ubuntu.com && [ "$(kd_read "$jp")" = false ] &&
+       [ "$(ext_state just-perfection-desktop@just-perfection)" = ACTIVE ]; then
+      kd_raw_write "$jp" true; sleep 0.5; kd_raw_write "$jp" false
+      fl_log "overview dash hidden again (Just Perfection)"
+    fi
+  fi
+  local tries=0 tf="$DESK_STATE/finish-login-tries"
+  if [ "$failed" -gt 0 ]; then
+    tries="$(cat "$tf" 2>/dev/null || echo 0)"; case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
+    tries=$((tries + 1)); echo "$tries" >"$tf"
+  fi
+  if [ "$failed" -gt 0 ] && [ "$tries" -ge 3 ]; then
+    # a key that fails three runs in a row (schema gone, dconf refuses it) will not change by waiting
+    fl_log "gave up after $tries runs on $failed change(s): $(tr '\t\n' ' ;' <"$DESK_STATE/pending-left.tsv")"
+    printf '%s\n' "finish-login: gave up on $failed change(s) after $tries runs (log: $FL_LOG)" >>"$REPORT"
+    failed=0
+  elif [ "$failed" -gt 0 ]; then
+    # keep what failed for the next login (or a run by hand); the autostart entry stays
+    cat "$DESK_STATE/pending-left.tsv" >"$PENDING"; rm -f "$DESK_STATE/pending-left.tsv"
+    printf '%s\n' "finish-login: $failed of $((applied + failed)) change(s) failed on $(date +%F), kept for the next login (log: $FL_LOG)" >>"$REPORT"
+    [ "$login" = 1 ] || echo "finish-login: $failed change(s) failed, kept for the next login; see $FL_LOG" >&2
+    have notify-send && [ "$login" = 1 ] && { notify-send -a "Work kit" "Desktop setup not finished" "$failed change(s) failed. Details: $FL_LOG" || true; }
+    return 1
+  fi
+  rm -f "$DESK_STATE/pending-left.tsv" "$PENDING" "$FINISH_AUTOSTART" "$tf"
+  if [ -f "$FILES" ]; then
+    tmp="$(mktemp)"; grep -vF "$FINISH_AUTOSTART$TAB" "$FILES" >"$tmp"; cat "$tmp" >"$FILES"; rm -f "$tmp"
+  fi
+  if [ -f "$f" ]; then
+    tmp="$(mktemp)"; sed 's/^pending_login=.*/pending_login=0/' "$f" >"$tmp"; cat "$tmp" >"$f"; rm -f "$tmp"
+  fi
+  [ -z "$uuid" ] || printf '%s\n' "$uuid" >>"$DESK_STATE/login-applied"
+  printf '%s\n' "finish-login: applied $applied pending desktop change(s) on $(date +%F)" >>"$REPORT"
+  fl_log "done: queue applied, autostart entry removed"
+  echo "finish-login: applied $applied pending change(s)"
+  if have notify-send; then
+    notify-send -a "Work kit" "Desktop setup finished" "The new extensions are active; dock and tiling keys are switched over. Super+K lists the keys." || true
+  fi
+  return 0
+}
+
+cmd_theme() {
+  local name="" keep_wp=0 t toml out mode accent yaru gacc bg f
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --list) for t in "$SHARE"/themes/*.toml; do basename "$t" .toml; done; return 0 ;;
+      --keep-wallpaper) keep_wp=1 ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  if [ -z "$name" ]; then
+    echo "Themes:"; local i=0 list=()
+    for t in "$SHARE"/themes/*.toml; do i=$((i + 1)); list+=("$(basename "$t" .toml)"); printf '  %2d) %s\n' "$i" "${list[$((i - 1))]}"; done
+    printf 'Number (current: %s): ' "$(cat "$DESK_CONF/theme/name" 2>/dev/null || echo none)"
+    read -r i
+    case "$i" in ''|*[!0-9]*) echo "cancelled"; return 0 ;; esac
+    [ "$i" -ge 1 ] && [ "$i" -le "${#list[@]}" ] || { echo "no such theme"; return 1; }
+    name="${list[$((i - 1))]}"
+  fi
+  toml="$SHARE/themes/$name.toml"
+  [ -f "$toml" ] || die "unknown theme: $name (kit-desk theme --list)"
+  desk_init_state
+  out="$DESK_CONF/theme"; mkdir -p "$out"
+  theme_render "$toml" "$SHARE/templates/ghostty.conf.tpl" "$name" >"$out/ghostty.conf"
+  theme_render "$toml" "$SHARE/templates/alacritty.toml.tpl" "$name" >"$out/alacritty.toml"
+  theme_render "$toml" "$SHARE/templates/btop.theme.tpl" "$name" >"$out/btop.theme"
+  theme_render "$toml" "$SHARE/templates/zellij.kdl.tpl" "$name" >"$out/zellij.kdl"
+  theme_render "$toml" "$SHARE/templates/nvim-palette.lua.tpl" "$name" >"$out/nvim-palette.lua"
+  echo "$name" >"$out/name"
+  desk_record "$DESK_CONF" -
+
+  # btop and zellij read their theme from their own config dirs
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+  mkdir -p "$cfg/btop/themes"
+  [ -e "$cfg/btop/themes/work-kit.theme" ] || desk_record "$cfg/btop/themes/work-kit.theme" -
+  cp "$out/btop.theme" "$cfg/btop/themes/work-kit.theme"
+  if [ -f "$cfg/btop/btop.conf" ]; then
+    if grep -q '^color_theme' "$cfg/btop/btop.conf"; then
+      sed 's|^color_theme = .*|color_theme = "work-kit"|' "$cfg/btop/btop.conf" >"$cfg/btop/btop.conf.tmp" && mv "$cfg/btop/btop.conf.tmp" "$cfg/btop/btop.conf"
+    else echo 'color_theme = "work-kit"' >>"$cfg/btop/btop.conf"; fi
+  else
+    echo 'color_theme = "work-kit"' >"$cfg/btop/btop.conf"; desk_record "$cfg/btop/btop.conf" -
+  fi
+  if have zellij || [ -x "$BIN_DIR/zellij" ]; then
+    mkdir -p "$cfg/zellij/themes"
+    [ -e "$cfg/zellij/themes/work-kit.kdl" ] || desk_record "$cfg/zellij/themes/work-kit.kdl" -
+    cp "$out/zellij.kdl" "$cfg/zellij/themes/work-kit.kdl"
+  fi
+  if grep -q 'work-kit' "$cfg/nvim/init.lua" 2>/dev/null; then
+    mkdir -p "$cfg/nvim/lua/work-kit"
+    [ -e "$cfg/nvim/lua/work-kit/palette.lua" ] || desk_record "$cfg/nvim/lua/work-kit/palette.lua" -
+    cp "$out/nvim-palette.lua" "$cfg/nvim/lua/work-kit/palette.lua"
+  fi
+
+  if [ "$DESKTOP" = kde ] && [ -n "$PLASMA" ] && [ "${DESK_NO_GNOME:-1}" = 1 ]; then
+    kde_colors "$(theme_get "$toml" mode)"
+  fi
+  # GNOME: dark/light, accent, Yaru variant, Tiling Shell border, Space Bar, background
+  if [ "${DESK_NO_GNOME:-0}" != 1 ] && gnome_major >/dev/null 2>&1 && { have dconf || have gsettings; }; then
+    mode="$(theme_get "$toml" mode)"; accent="$(theme_get "$toml" accent)"
+    yaru="$(theme_get "$toml" yaru)"; gacc="$(theme_get "$toml" gnome_accent)"; bg="$(theme_get "$toml" background)"
+    local p=/org/gnome/desktop/interface
+    if [ "$mode" = light ]; then kd_write $p/color-scheme "'prefer-light'" || true
+    else kd_write $p/color-scheme "'prefer-dark'" || true; fi
+    for f in /usr/share/themes/Yaru-"$yaru"-dark /usr/share/themes/Yaru-"$yaru"; do
+      if [ -d "$f" ]; then
+        if [ "$mode" = light ]; then kd_write $p/gtk-theme "'Yaru-$yaru'" || true
+        else kd_write $p/gtk-theme "'Yaru-$yaru-dark'" || true; fi
+        [ -d "/usr/share/icons/Yaru-$yaru" ] && { kd_write $p/icon-theme "'Yaru-$yaru'" || true; }
+        break
+      fi
+    done
+    # accent-color exists from GNOME 47 (Ubuntu 26.04); writing it on 46 would fail the schema
+    if [ "$(gnome_major)" -ge 47 ]; then kd_write $p/accent-color "'$gacc'" || true; fi
+    if [ -d "$EXT_DIR/kit-tiling@work-kit" ]; then
+      kd_write /org/gnome/shell/extensions/kit-tiling/border-color "'$accent'" || true
+      kd_write /org/gnome/shell/extensions/kit-tiling/inactive-border-color "'$(theme_get "$toml" muted)'" || true
+    fi
+    if [ -d "$EXT_DIR/tilingshell@ferrarodomenico.com" ]; then
+      kd_write /org/gnome/shell/extensions/tilingshell/window-border-color "'$accent'" || true
+    fi
+    if [ -d "$EXT_DIR/space-bar@luchrioh" ]; then
+      kd_write /org/gnome/shell/extensions/space-bar/appearance/active-workspace-background-color "'$accent'" || true
+      kd_write /org/gnome/shell/extensions/space-bar/appearance/active-workspace-text-color "'$bg'" || true
+    fi
+    if [ "$keep_wp" = 0 ]; then
+      # A solid image in the theme colour. An empty picture-uri made GNOME 46 try to load the
+      # working directory ("Failed to load background 'file:///home/...': Is a directory").
+      # One file name per theme, so GNOME does not keep a cached image of the previous one.
+      local b=/org/gnome/desktop/background img uri
+      rm -f "$out"/background-*.svg
+      img="$out/background-$name.svg"
+      printf '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="%s"/></svg>\n' "$bg" >"$img"
+      uri="file://$(printf '%s' "$img" | sed 's/%/%25/g; s/ /%20/g')"
+      kd_write $b/picture-uri "'$uri'" || true
+      kd_write $b/picture-uri-dark "'$uri'" || true
+      kd_write $b/picture-options "'zoom'" || true
+      kd_write $b/color-shading-type "'solid'" || true
+      kd_write $b/primary-color "'$bg'" || true
+    fi
+  fi
+  echo "theme: $name (new terminal windows use it; restart btop, nvim and zellij)"
+}
+
+cmd_status() {
+  local g
+  g="$(gnome_major || true)"
+  echo "GNOME Shell: ${g:-not found}"
+  [ -f "$DESK_STATE/install.conf" ] && sed 's/^/install: /' "$DESK_STATE/install.conf"
+  echo "theme: $(cat "$DESK_CONF/theme/name" 2>/dev/null || echo none)"
+  if [ -s "$PENDING" ]; then
+    echo "PENDING until the next login: $(wc -l <"$PENDING" | tr -d ' ') desktop change(s) wait for the new extensions to load."
+    grep -q "ubuntu-dock@ubuntu.com" "$PENDING" && echo "  - Ubuntu Dock and desktop icons stay on until then, then they are turned off"
+    grep -q "tiling-assistant@ubuntu.com\|tilingshell/" "$PENDING" && echo "  - GNOME's own half-screen tiling and keys stay until then, then $(conf_get tiler) takes over"
+    if [ -f "$FINISH_AUTOSTART" ]; then echo "  Applied automatically at the next login ($FINISH_AUTOSTART)."
+    else echo "  No autostart entry: apply them with: kit-desk finish-login"; fi
+    echo "  Still pending after a login? Run in a terminal of the desktop session: kit-desk finish-login"
+    [ -f "$FL_LOG" ] && { echo "  Last runs ($FL_LOG):"; tail -n 4 "$FL_LOG" | sed 's/^/    /'; }
+    sed 's/^/  queued: /' "$PENDING" | tr '\t' ' '
+  fi
+  if [ -n "$g" ]; then
+    echo "enabled extensions: $(kd_effective /org/gnome/shell/enabled-extensions)"
+    echo "disable-user-extensions: $(kd_effective /org/gnome/shell/disable-user-extensions)"
+    if have gnome-extensions; then
+      for u in kit-tiling@work-kit tilingshell@ferrarodomenico.com paperwm@paperwm.github.com tactile@lundal.io forge@jmmaranan.com space-bar@luchrioh just-perfection-desktop@just-perfection clipboard-indicator@tudmotu.com; do
+        gnome-extensions info "$u" 2>/dev/null | grep -iE '^ *(state|enabled)' | sed "s/^ */$u: /" || true
+      done
+    fi
+  fi
+  echo "journaled dconf keys: $(wc -l <"$JOURNAL" 2>/dev/null | tr -d ' ' || echo 0)"
+  [ -f "$REPORT" ] && { echo "last install report:"; sed 's/^/  /' "$REPORT"; }
+  return 0
+}
+
+sub="${1:-help}"; [ "$#" -gt 0 ] && shift
+case "$sub" in
+  term) cmd_term "$@" ;;
+  browser) cmd_browser "$@" ;;
+  editor) cmd_editor "$@" ;;
+  files) cmd_files "$@" ;;
+  keys) cmd_keys "$@" ;;
+  menu) cmd_menu ;;
+  power) cmd_power ;;
+  settings) cmd_settings "$@" ;;
+  emoji) cmd_emoji ;;
+  welcome) cmd_welcome ;;
+  finish-login) cmd_finish_login "$@" ;;
+  kde-keys) cmd_kde_keys ;;
+  theme) cmd_theme "$@" ;;
+  status|doctor) cmd_status ;;
+  *) echo "kit-desk: unknown command: $sub" >&2; usage >&2; exit 2 ;;
+esac

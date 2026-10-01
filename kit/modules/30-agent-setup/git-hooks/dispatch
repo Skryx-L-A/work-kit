@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# work-kit git-hook dispatcher (kit-sync)
+# kit-sync copies this file under every hook name into ~/.config/work-kit/git-hooks and sets
+# git's global core.hooksPath there. Git then ignores .git/hooks, so this script:
+#   commit-msg  removes "Co-authored-by:" lines from the message (agent co-author trailers);
+#               a repository can keep them with `git config work-kit.keepCoAuthors true`
+#   pre-commit  runs 40-data-guard on staged changes when data-guard is enabled for all
+#               repositories (flag file .data-guard-global) or for this repository
+#               (listed in hooked-repos.list), unless the repository hook runs it already
+#   every hook  then runs the repository's own hook (.git/hooks/<name>), e.g. the reindex
+#               hooks of 20-brain, and returns its exit code
+# Pure bash: no grep, sed or awk, so it works on a minimal system.
+name="${0##*/}"
+here="$(cd "$(dirname "$0")" && pwd)"
+MARK="work-kit git-hook dispatcher"
+DG_MARK="work-kit data-guard hook"
+
+has_line() { # has_line FILE TEXT: FILE contains TEXT within its first 20 lines
+  local n=0 line
+  [ -f "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *"$2"*) return 0 ;; esac
+    n=$((n + 1)); [ "$n" -ge 20 ] && break
+  done <"$1"
+  return 1
+}
+
+has_text() { # has_text FILE TEXT: FILE contains TEXT
+  local line
+  [ -f "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *"$2"*) return 0 ;; esac
+  done <"$1"
+  return 1
+}
+
+uses_lfs() {
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  has_text "$top/.gitattributes" "filter=lfs" && return 0
+  git config --local --get lfs.repositoryformatversion >/dev/null 2>&1 && return 0
+  git config --local --get-regexp '^filter\.lfs\.' >/dev/null 2>&1 && return 0
+  return 1
+}
+
+strip_coauthors() { # strip_coauthors MSGFILE
+  local f="$1" line out=() i
+  [ -f "$f" ] || return 0
+  [ "$(git config --bool work-kit.keepCoAuthors 2>/dev/null)" = true ] && return 0
+  local changed=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    local lead="${line#"${line%%[![:space:]]*}"}"
+    case "$lead" in
+      [Cc][Oo]-[Aa][Uu][Tt][Hh][Oo][Rr][Ee][Dd]-[Bb][Yy]:*) changed=1; continue ;;
+    esac
+    out+=("$line")
+  done <"$f"
+  [ "$changed" = 1 ] || return 0
+  i=${#out[@]}
+  while [ "$i" -gt 0 ] && [[ -z "${out[$((i - 1))]//[[:space:]]/}" ]]; do i=$((i - 1)); done
+  if [ "$i" -gt 0 ]; then printf '%s\n' "${out[@]:0:$i}" >"$f"; else : >"$f"; fi
+}
+
+common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=""
+repo_hook=""
+if [ -n "$common" ]; then
+  case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
+  repo_hook="$common/hooks/$name"
+  if [ ! -x "$repo_hook" ] || [ "$repo_hook" -ef "$0" ] || has_line "$repo_hook" "$MARK"; then
+    repo_hook=""
+  fi
+fi
+
+if [ "$name" = commit-msg ]; then
+  strip_coauthors "${1:-}"
+fi
+
+if [ "$name" = pre-commit ]; then
+  dg="${DATA_GUARD_BIN:-${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/data-guard/data-guard}"
+  conf="${XDG_CONFIG_HOME:-$HOME/.config}/work-kit"
+  want=0
+  [ -e "$here/.data-guard-global" ] && want=1
+  if [ "$want" = 0 ] && [ -f "$conf/hooked-repos.list" ]; then
+    top="$(git rev-parse --show-toplevel 2>/dev/null)"
+    while IFS= read -r r || [ -n "$r" ]; do
+      [ -n "$r" ] && [ "$r" = "$top" ] && { want=1; break; }
+    done <"$conf/hooked-repos.list"
+  fi
+  if [ "$want" = 1 ] && ! has_line "$repo_hook" "$DG_MARK"; then
+    if [ -x "$dg" ]; then
+      "$dg" staged || exit $?
+    elif [ "${DATA_GUARD_ALLOW_UNSCANNED:-0}" = 1 ]; then
+      echo "git-hooks: WARNING: data-guard is enabled but $dg is missing; commit is not checked (DATA_GUARD_ALLOW_UNSCANNED=1)" >&2
+    else
+      echo "git-hooks: BLOCKED: data-guard is enabled but $dg is missing, so the commit cannot be checked." >&2
+      echo "git-hooks: Install module 40-data-guard again, or for this one commit only: DATA_GUARD_ALLOW_UNSCANNED=1 git commit ..." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# A global core.hooksPath suppresses the hooks that `git lfs install` would create in
+# .git/hooks.  Invoke LFS only when there is no repository hook to preserve, so a
+# repository that deliberately owns a hook keeps its existing behaviour.  Do this
+# before the final exec: pre-push then inherits the original stdin.
+case "$name" in
+  pre-push|post-checkout|post-commit|post-merge)
+    if [ -z "$repo_hook" ] && uses_lfs; then
+      if command -v git-lfs >/dev/null 2>&1; then
+        git lfs "$name" "$@" || exit $?
+      else
+        echo "git-hooks: WARNING: repository uses Git LFS but git-lfs is not on PATH; skipping $name" >&2
+      fi
+    fi
+    ;;
+esac
+
+if [ -n "$repo_hook" ]; then
+  exec "$repo_hook" "$@"
+fi
+exit 0

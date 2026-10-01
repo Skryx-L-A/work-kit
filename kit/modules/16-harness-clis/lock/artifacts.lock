@@ -1,0 +1,12 @@
+# 16-harness-clis pinned downloads: sha256  path-under-offline/harness-clis  source
+# Written by `fetch.sh --relock`. Every sha256 equals the publisher's own digest, read at relock
+# time (docs/harness-clis.md lists where): claude = GPG-signed manifest.json, codex and copilot =
+# GitHub asset digest and the release's SHA256SUMS file, opencode = GitHub asset digest.
+# The gemini and pi lines are the packed node_modules trees of lock/gemini and lock/pi (npm ci,
+# integrity from the registry). Aider wheels are pinned with hashes in aider-requirements.txt.
+1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2  claude/claude-2.1.283-linux-x64  https://downloads.claude.ai/claude-code-releases/2.1.283/linux-x64/claude
+8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6  codex/codex-package-0.156.1-x86_64-unknown-linux-musl.tar.gz  https://github.com/openai/codex/releases/download/rust-v0.156.1/codex-package-x86_64-unknown-linux-musl.tar.gz
+42f40c08ff8a8ff78522161e4b5e2b86340ad8bb0853a5f1aa64ce65b48d007b  copilot/copilot-1.0.88-linux-x64.tar.gz  https://github.com/github/copilot-cli/releases/download/v1.0.88/copilot-linux-x64.tar.gz
+4fea649043096b7f6e335174172ff4492e679b654951d05b2626416bb03a0ac2  gemini/gemini-cli-0.61.0-linux-x64.tar  npm-ci:lock/gemini
+763af386ef88a8cab18df00fcf055690e5a55e31a7088beabe02307142a6adce  opencode/opencode-1.18.32-linux-x64-baseline.tar.gz  https://github.com/anomalyco/opencode/releases/download/v1.18.32/opencode-linux-x64-baseline.tar.gz
+7dbf865a201afda9a6ce7f4b4e83c93e443e37cd1e8ccd5f732543a311dfa1bd  pi/pi-coding-agent-0.87.1-linux-x64.tar  npm-ci:lock/pi

@@ -1,0 +1,9 @@
+# USD per million tokens, per model name as the API reports it (gen_ai.response.model or the
+# requested model). Calls to models without an entry get cost "unknown", never 0.
+# Values below are placeholders: TODO(ask IT) for the prices of the approved endpoints.
+
+# [models."gpt-4.1"]
+# input_per_1m = 0.0
+# output_per_1m = 0.0
+
+# Local models cost nothing per token; run the proxy with --free for kit-llm instead.

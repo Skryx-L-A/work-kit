@@ -1,0 +1,45 @@
+# MCP allowlist (default deny). Only servers listed here may be configured in any harness.
+# Read by `ai-gov mcp-check`. Format: plain YAML subset: mappings, lists, "- " items,
+# inline lists [a, b], quoted or plain scalars, # comments. No anchors, no multi-line strings.
+#
+# Per server:
+#   name          server name as used in the harness config (required)
+#   transport     stdio | http                              (required)
+#   command       stdio: executable name or absolute path   (stdio: required)
+#   args          stdio: expected leading arguments, e.g. [mcp] or ["pkg@1.2.3"]
+#   url           http: exact URL                            (http: required)
+#   blast_radius  read | reversible | irreversible (highest of its tools; unknown = irreversible)
+#   tools         optional per-tool tags, e.g. {search: read, new_note: reversible}
+#   data_class    highest data class it may see: PUBLIC | INTERNAL | CONFIDENTIAL | CUSTOMER
+#   harnesses     optional list; omitted = all harnesses
+#   owner, approved_by, approved_on, review_by (YYYY-MM-DD), notes
+version: 1
+default: deny
+servers:
+  # The kit's own knowledge base. Local, no network, notes are under git (reversible).
+  - name: brain
+    transport: stdio
+    command: brain
+    args: [mcp]
+    blast_radius: reversible
+    tools: {search: read, read: read, recent: read, new_note: reversible, append: reversible}
+    data_class: INTERNAL
+    owner: TODO(ask IT)
+    approved_by: TODO(ask IT)
+    approved_on: TODO(ask IT)
+    review_by: TODO(ask IT)
+    notes: shipped with work-kit module 20-brain; raise data_class only after IT confirms local tools for CONFIDENTIAL
+  # Questions over approved company documents (module 18-doc-qa). Off until IT approves a scope;
+  # its tools only read the local index. Registered by kit-sync as `doc-qa mcp`.
+  - name: doc-qa
+    transport: stdio
+    command: doc-qa
+    args: [mcp]
+    blast_radius: read
+    tools: {ask_documents: read, documents_status: read}
+    data_class: CONFIDENTIAL
+    owner: TODO(ask IT)
+    approved_by: TODO(ask IT)
+    approved_on: TODO(ask IT)
+    review_by: TODO(ask IT)
+    notes: shipped with work-kit module 18-doc-qa; the document scope in doc-qa.toml decides what it can see

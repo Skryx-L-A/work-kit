@@ -1,0 +1,10 @@
+/* Design tokens. `kit-design new web` rewrites this file from design-refs/brand/theme.json. */
+:root {
+  --text: #1d232b;
+  --bg: #ffffff;
+  --accent: #0f5f8c;
+  --muted: #5c6670;
+  --surface: #eef2f5;
+  --font-heading: system-ui, "Segoe UI", Ubuntu, "Liberation Sans", Arial, sans-serif;
+  --font-body: system-ui, "Segoe UI", Ubuntu, "Liberation Sans", Arial, sans-serif;
+}

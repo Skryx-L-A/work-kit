@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# kit-new: start a prototype from the project template.
+# Usage: kit-new <name> [--dir PARENT]    (default parent: ~/work)
+set -euo pipefail
+
+DATA="${KIT_DATA_DIR:-$HOME/.local/share/work-kit}"
+TEMPLATE="${KIT_TEMPLATE_DIR:-$DATA/terminal/project-template}"
+[ -d "$TEMPLATE" ] || TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/project-template"
+
+name=""
+parent="$HOME/work"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) parent="${2:?--dir needs a value}"; shift 2 ;;
+    -h|--help) sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "kit-new: unknown option $1" >&2; exit 2 ;;
+    *) name="$1"; shift ;;
+  esac
+done
+[ -n "$name" ] || { echo "usage: kit-new <name> [--dir PARENT]" >&2; exit 2; }
+case "$name" in
+  *[!a-z0-9._-]*|.*) echo "kit-new: name must be lowercase letters, digits, . _ - (not starting with .)" >&2; exit 2 ;;
+esac
+[ -d "$TEMPLATE" ] || { echo "kit-new: template not found: $TEMPLATE" >&2; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "kit-new: git not found; install it with: bash <kit>/modules/01-prereqs/install.sh git" >&2; exit 1; }
+
+dir="$parent/$name"
+[ ! -e "$dir" ] || { echo "kit-new: $dir already exists" >&2; exit 1; }
+mkdir -p "$dir"
+cp -R "$TEMPLATE/." "$dir/"
+sed "s/{{name}}/$name/g" "$dir/README.md" >"$dir/README.md.tmp"
+mv "$dir/README.md.tmp" "$dir/README.md"
+
+# The template owns this initial .envrc. Later edits remain subject to direnv's normal re-allow.
+if [ -f "$dir/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+  direnv allow "$dir"
+fi
+
+trust_claude_project() {
+  command -v claude >/dev/null 2>&1 || return 0
+  local config="$HOME/.claude.json"
+  if [ ! -f "$config" ]; then
+    echo "kit-new: Claude trust not recorded (~/.claude.json missing)"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "kit-new: Claude trust not recorded (python3 missing)"
+    return 0
+  fi
+  if ! python3 - "$config" "$dir" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path = sys.argv[1]
+project = sys.argv[2]
+try:
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("root is not an object")
+    projects = data.get("projects")
+    if projects is None:
+        projects = {}
+        data["projects"] = projects
+    if not isinstance(projects, dict):
+        raise ValueError("projects is not an object")
+    entry = projects.get(project)
+    if entry is None:
+        entry = {}
+        projects[project] = entry
+    if not isinstance(entry, dict):
+        raise ValueError("project entry is not an object")
+    entry["hasTrustDialogAccepted"] = True
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=os.path.dirname(path) or ".")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp, mode)
+    os.replace(temp, path)
+finally:
+    try:
+        os.unlink(temp)
+    except FileNotFoundError:
+        pass
+PY
+  then
+    echo "kit-new: Claude trust not recorded (~/.claude.json invalid)"
+  fi
+}
+
+trust_claude_project
+
+git -C "$dir" init -q
+if command -v kit-sync >/dev/null 2>&1; then
+  kit-sync --project "$dir" >/dev/null && echo "agent files written (AGENTS.md, CLAUDE.md, ...)"
+else
+  echo "kit-sync not installed (module 30-agent-setup): no agent files written"
+fi
+if command -v data-guard >/dev/null 2>&1; then
+  data-guard install-hook "$dir" >/dev/null && echo "data-guard hook installed"
+else
+  echo "data-guard not installed (module 40-data-guard): no commit hook"
+fi
+# git refuses to commit without a name and email. Ask for them on a terminal (kept in the
+# global git config, so this happens once); without a terminal say how to set them.
+have_identity() {
+  { [ -n "$(git -C "$dir" config user.name 2>/dev/null)" ] || [ -n "${GIT_AUTHOR_NAME:-}" ]; } \
+    && { [ -n "$(git -C "$dir" config user.email 2>/dev/null)" ] || [ -n "${GIT_AUTHOR_EMAIL:-}" ]; }
+}
+if ! have_identity && [ -t 0 ] && [ -t 2 ]; then
+  echo "git needs your name and email to commit (saved with git config --global)." >&2
+  read -r -p "Name: " gname || true
+  read -r -p "Email: " gemail || true
+  if [ -n "${gname:-}" ] && [ -n "${gemail:-}" ]; then
+    git config --global user.name "$gname"
+    git config --global user.email "$gemail"
+  fi
+fi
+if ! have_identity; then
+  {
+    echo "kit-new: created $dir but did NOT commit: git has no user name and email."
+    echo "  git config --global user.name  \"Your Name\""
+    echo "  git config --global user.email \"you@example.com\""
+    echo "then: git -C $dir add . && git -C $dir commit -m \"Initial commit from project template\""
+  } >&2
+  exit 1
+fi
+# Only the fresh template files are in this new repository, so adding everything is safe.
+git -C "$dir" add .
+if ! commit_out="$(git -C "$dir" commit -q -m "Initial commit from project template" 2>&1)"; then
+  echo "kit-new: created $dir but the initial commit failed:" >&2
+  printf '%s\n' "$commit_out" | sed 's/^/  /' >&2
+  exit 1
+fi
+echo "committed"
+echo "created $dir"

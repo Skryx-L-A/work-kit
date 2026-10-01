@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""ai-gov: AI governance helpers of work-kit (module 13-ai-governance).
+
+  ai-gov mcp-check [--project DIR] [--allowlist FILE] [--json] [--strict]
+      List the MCP servers configured in every harness found under $HOME (and in DIR) and
+      flag the ones the allowlist does not allow. Exit 1 when something must be fixed.
+  ai-gov open-questions [FILE ...]
+      List every TODO(ask IT) placeholder in the installed policy files: the questions for IT.
+  ai-gov template NAME
+      Print a template (ai-system-record, ai-tool-request, ai-incident, literacy-record).
+
+Standard library only (Python 3.9+; TOML needs 3.11+). No network. Reads config files only;
+it never changes them and never prints secret values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "work-kit"
+FAIL = ("NOT-ALLOWED", "MISMATCH", "UNPINNED", "INLINE-SECRET", "EXPIRED", "AUTO-APPROVED")
+WARN = ("UNCONFIRMED", "UNREADABLE")
+RADII = ("read", "reversible", "irreversible")
+LAUNCHERS = {"npx", "bunx", "uvx", "pipx", "pnpx"}
+SECRET_KEY = re.compile(r"(token|secret|passw|api[_-]?key|apikey|auth|credential|private[_-]?key)", re.I)
+ENV_REF = re.compile(r"^\s*(\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{env:[^}]+\}|\$\{env:[^}]+\}|\$\{input:[^}]+\})\s*$")
+
+
+# ---------------------------------------------------------------------------- YAML subset
+
+def _scalar(tok: str):
+    tok = tok.strip()
+    if not tok:
+        return None
+    if tok[0] in "\"'" and tok[-1] == tok[0] and len(tok) >= 2:
+        return tok[1:-1]
+    if tok.startswith("[") and tok.endswith("]"):
+        return [_scalar(x) for x in _split_flow(tok[1:-1]) if x.strip()]
+    if tok.startswith("{") and tok.endswith("}"):
+        out = {}
+        for part in _split_flow(tok[1:-1]):
+            if part.strip():
+                k, _, v = part.partition(":")
+                out[_scalar(k)] = _scalar(v)
+        return out
+    low = tok.lower()
+    if low in ("true", "yes"):
+        return True
+    if low in ("false", "no"):
+        return False
+    if low in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", tok):
+        return int(tok)
+    return tok
+
+
+def _split_flow(s: str) -> list:
+    parts, depth, cur, quote = [], 0, "", ""
+    for ch in s:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            cur += ch
+        elif ch in "[{":
+            depth += 1
+            cur += ch
+        elif ch in "]}":
+            depth -= 1
+            cur += ch
+        elif ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return parts
+
+
+def _strip_comment(line: str) -> str:
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _key_value(text: str):
+    m = re.match(r"^(\"[^\"]*\"|'[^']*'|[^:\s][^:]*?)\s*:(\s+(.*))?$", text)
+    if not m:
+        return None
+    return _scalar(m.group(1)), (m.group(3) or "")
+
+
+def parse_yaml_subset(text: str):
+    """Parse block mappings, block lists, flow lists/maps and scalars. Raises ValueError."""
+    lines = []
+    for raw in text.splitlines():
+        if raw.strip().startswith("---") and not lines:
+            continue
+        line = _strip_comment(raw)
+        if line.strip():
+            if "\t" in line[: len(line) - len(line.lstrip())]:
+                raise ValueError("tabs in indentation")
+            lines.append((len(line) - len(line.lstrip()), line.strip()))
+    pos = 0
+
+    def block(indent: int):
+        nonlocal pos
+        if pos >= len(lines):
+            return None
+        if lines[pos][1].startswith("- ") or lines[pos][1] == "-":
+            out = []
+            while pos < len(lines) and lines[pos][0] == indent and (lines[pos][1].startswith("- ") or lines[pos][1] == "-"):
+                rest = lines[pos][1][1:].strip()
+                if not rest:
+                    pos += 1
+                    out.append(block(lines[pos][0]) if pos < len(lines) and lines[pos][0] > indent else None)
+                    continue
+                kv = _key_value(rest) if not rest.startswith(("[", "{", "\"", "'")) else None
+                if kv:
+                    # "- key: value" starts a mapping whose other keys sit at indent + 2.
+                    lines[pos] = (indent + 2, rest)
+                    out.append(mapping(indent + 2))
+                else:
+                    out.append(_scalar(rest))
+                    pos += 1
+            return out
+        return mapping(indent)
+
+    def mapping(indent: int):
+        nonlocal pos
+        out = {}
+        while pos < len(lines) and lines[pos][0] == indent:
+            kv = _key_value(lines[pos][1])
+            if kv is None:
+                raise ValueError(f"cannot parse line: {lines[pos][1]!r}")
+            key, val = kv
+            pos += 1
+            if val:
+                out[key] = _scalar(val)
+            elif pos < len(lines) and (lines[pos][0] > indent or (lines[pos][0] == indent and lines[pos][1].startswith("- "))):
+                out[key] = block(lines[pos][0])
+            else:
+                out[key] = None
+        if pos < len(lines) and lines[pos][0] > indent:
+            raise ValueError(f"unexpected indentation: {lines[pos][1]!r}")
+        return out
+
+    result = block(lines[0][0]) if lines else None
+    if pos < len(lines):
+        raise ValueError(f"unexpected content: {lines[pos][1]!r}")
+    return result
+
+
+def load_yaml(path: Path):
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore  # optional, used when present
+        return yaml.safe_load(text)
+    except ImportError:
+        pass
+    try:
+        return parse_yaml_subset(text)
+    except ValueError:
+        yq = shutil.which("yq")
+        if not yq:
+            raise
+        res = subprocess.run([yq, "-o=json", ".", str(path)], capture_output=True, text=True, check=True)
+        return json.loads(res.stdout)
+
+
+def load_toml(path: Path):
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError as exc:
+        raise ValueError("TOML needs Python 3.11 or newer") from exc
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def load_json(path: Path):
+    text = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # VS Code and opencode allow comments and trailing commas (JSONC).
+        text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", text, flags=re.S)
+        text = re.sub(r",(\s*[}\]])", r"\1", text)
+        return json.loads(text)
+
+
+# ---------------------------------------------------------------------------- harness configs
+
+def _server(harness, file, name, spec: dict) -> dict:
+    spec = spec if isinstance(spec, dict) else {}
+    cmd = spec.get("command")
+    args = list(spec.get("args") or [])
+    if isinstance(cmd, list):  # opencode: command is an array
+        cmd, args = (cmd[0] if cmd else None), list(cmd[1:]) + args
+    url = spec.get("url") or spec.get("httpUrl") or spec.get("serverUrl")
+    env = {}
+    for key in ("env", "environment", "headers", "http_headers"):
+        if isinstance(spec.get(key), dict):
+            env.update({str(k): v for k, v in spec[key].items()})
+    secrets = sorted(k for k, v in env.items()
+                     if SECRET_KEY.search(k) and isinstance(v, str) and v.strip() and not ENV_REF.match(v))
+    if isinstance(spec.get("bearer_token"), str):
+        secrets.append("bearer_token")
+    return {
+        "harness": harness, "file": str(file), "name": str(name),
+        "transport": "http" if url and not cmd else "stdio",
+        "command": cmd, "args": [str(a) for a in args], "url": url,
+        "inline_secrets": secrets, "trust": spec.get("trust") is True,
+        "enabled": spec.get("enabled", True) is not False and spec.get("disabled") is not True,
+    }
+
+
+def _servers_from(harness, file, data, key) -> list:
+    block = data.get(key) if isinstance(data, dict) else None
+    if isinstance(block, dict):
+        return [_server(harness, file, n, s) for n, s in block.items()]
+    if isinstance(block, list):  # Continue: list of {name: ...}
+        return [_server(harness, file, s.get("name", f"#{i}"), s) for i, s in enumerate(block) if isinstance(s, dict)]
+    return []
+
+
+def config_sources(home: Path, project: Path | None) -> list:
+    """(harness, path, loader, key) for every known MCP config location."""
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    copilot = Path(os.environ.get("COPILOT_HOME") or home / ".copilot")
+    src = [
+        ("claude-code", home / ".claude.json", load_json, "mcpServers"),
+        ("codex", home / ".codex" / "config.toml", load_toml, "mcp_servers"),
+        ("gemini-cli", home / ".gemini" / "settings.json", load_json, "mcpServers"),
+        ("opencode", xdg / "opencode" / "opencode.json", load_json, "mcp"),
+        ("opencode", xdg / "opencode" / "opencode.jsonc", load_json, "mcp"),
+        ("cursor", home / ".cursor" / "mcp.json", load_json, "mcpServers"),
+        ("vscode", xdg / "Code" / "User" / "mcp.json", load_json, "servers"),
+        ("vscode", home / "Library" / "Application Support" / "Code" / "User" / "mcp.json", load_json, "servers"),
+        ("copilot-cli", copilot / "mcp-config.json", load_json, "mcpServers"),
+        ("continue", home / ".continue" / "config.yaml", load_yaml, "mcpServers"),
+    ]
+    src += [("continue", p, load_yaml if p.suffix in (".yaml", ".yml") else load_json, None)
+            for p in sorted((home / ".continue" / "mcpServers").glob("*")) if p.is_file()]
+    if project:
+        p = project
+        src += [
+            ("project:claude-code/copilot-cli", p / ".mcp.json", load_json, "mcpServers"),
+            ("project:copilot-cli", p / ".github" / "mcp.json", load_json, "mcpServers"),
+            ("project:codex", p / ".codex" / "config.toml", load_toml, "mcp_servers"),
+            ("project:gemini-cli", p / ".gemini" / "settings.json", load_json, "mcpServers"),
+            ("project:opencode", p / "opencode.json", load_json, "mcp"),
+            ("project:cursor", p / ".cursor" / "mcp.json", load_json, "mcpServers"),
+            ("project:vscode", p / ".vscode" / "mcp.json", load_json, "servers"),
+        ]
+        src += [("project:continue", f, load_yaml if f.suffix in (".yaml", ".yml") else load_json, None)
+                for f in sorted((p / ".continue" / "mcpServers").glob("*")) if f.is_file()]
+    return src
+
+
+def collect(home: Path, project: Path | None):
+    servers, problems = [], []
+    for harness, path, loader, key in config_sources(home, project):
+        if not path.is_file():
+            continue
+        try:
+            data = loader(path)
+        except Exception as exc:  # noqa: BLE001 - any parse error is reported, not raised
+            problems.append({"status": "UNREADABLE", "harness": harness, "file": str(path),
+                             "name": "-", "detail": f"could not parse ({exc.__class__.__name__}); check by hand"})
+            continue
+        if key is None:  # Continue block file: one server, or a list/dict of them
+            if isinstance(data, dict) and "mcpServers" in data:
+                servers += _servers_from(harness, path, data, "mcpServers")
+            elif isinstance(data, dict):
+                servers.append(_server(harness, path, data.get("name", path.stem), data))
+            continue
+        servers += _servers_from(harness, path, data, key)
+        if harness == "claude-code" and isinstance(data, dict):
+            for proj, pdata in (data.get("projects") or {}).items():
+                servers += _servers_from(f"claude-code (local: {proj})", path, pdata, "mcpServers")
+    return servers, problems
+
+
+def auto_approvals(home: Path, project: Path | None) -> list:
+    """(harness, file, server, tool-or-None) for every tool approved without asking."""
+    out = []
+    files = [home / ".claude" / "settings.json", home / ".claude" / "settings.local.json"]
+    if project:
+        files += [project / ".claude" / "settings.json", project / ".claude" / "settings.local.json"]
+    for f in files:
+        if not f.is_file():
+            continue
+        try:
+            data = load_json(f)
+        except Exception:  # noqa: BLE001
+            continue
+        for rule in ((data.get("permissions") or {}).get("allow") or []):
+            m = re.fullmatch(r"mcp__([^_]+(?:_[^_]+)*?)(?:__(.+))?", str(rule))
+            if m:
+                tool = m.group(2)
+                out.append(("claude-code", str(f), m.group(1), None if tool in (None, "*") else tool))
+        if data.get("enableAllProjectMcpServers") is True:
+            out.append(("claude-code", str(f), "*project .mcp.json servers*", "enableAllProjectMcpServers"))
+    for vs in (Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "Code" / "User" / "settings.json",
+               home / "Library" / "Application Support" / "Code" / "User" / "settings.json"):
+        if vs.is_file():
+            try:
+                data = load_json(vs)
+            except Exception:  # noqa: BLE001
+                continue
+            for key in ("chat.tools.global.autoApprove", "chat.tools.autoApprove"):
+                if data.get(key) is True:
+                    out.append(("vscode", str(vs), "*all*", key))
+    return out
+
+
+# ---------------------------------------------------------------------------- evaluation
+
+def _date(value):
+    try:
+        return dt.date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _unconfirmed(entry: dict) -> list:
+    return [k for k in ("approved_by", "approved_on", "review_by")
+            if not entry.get(k) or "TODO" in str(entry.get(k))]
+
+
+def _pinned(server: dict) -> bool:
+    cmd = Path(str(server.get("command") or "")).name
+    if cmd not in LAUNCHERS:
+        return True
+    pkgs = [a for a in server["args"] if not a.startswith("-")]
+    if cmd == "pipx" and pkgs[:1] == ["run"]:
+        pkgs = pkgs[1:]
+    if not pkgs:
+        return False
+    pkg = pkgs[0]
+    if cmd in ("uvx", "pipx"):
+        return bool(re.search(r"(==|@)\d", pkg))
+    return bool(re.search(r".@\d", pkg))  # npm: name@1.2.3 or @scope/name@1.2.3
+
+
+def _matches(server: dict, entry: dict) -> str | None:
+    """None when the server matches the allowlist entry, else the reason."""
+    if server["transport"] != (entry.get("transport") or "stdio"):
+        return f"transport {server['transport']} but allowlist says {entry.get('transport')}"
+    if server["transport"] == "http":
+        return None if server["url"] == entry.get("url") else f"url differs from allowlist ({entry.get('url')})"
+    want = str(entry.get("command") or "")
+    have = str(server.get("command") or "")
+    if ("/" in want and have != want) or ("/" not in want and Path(have).name != want):
+        return f"command '{have}' differs from allowlist '{want}'"
+    wargs = [str(a) for a in (entry.get("args") or [])]
+    if server["args"][: len(wargs)] != wargs:
+        return f"args {server['args']} do not start with allowlist args {wargs}"
+    return None
+
+
+def radius(entry: dict | None, tool: str | None) -> str:
+    if not entry:
+        return "irreversible"
+    tools = entry.get("tools") or {}
+    r = tools.get(tool) if tool and isinstance(tools, dict) else None
+    r = r or entry.get("blast_radius")
+    return r if r in RADII else "irreversible"
+
+
+def evaluate(servers, problems, approvals, allow: dict, today: dt.date) -> list:
+    entries = {str(e.get("name")): e for e in (allow.get("servers") or []) if isinstance(e, dict)}
+    rows = list(problems)
+    for s in servers:
+        base = {k: s[k] for k in ("harness", "file", "name")}
+        target = s["url"] if s["transport"] == "http" else " ".join([str(s["command"])] + s["args"])
+        entry = entries.get(s["name"])
+        found = []
+        harnesses = entry.get("harnesses") if entry else None
+        if not entry:
+            found.append(("NOT-ALLOWED", "not on the allowlist (default deny)"))
+        elif harnesses and not any(h in s["harness"] for h in harnesses):
+            found.append(("NOT-ALLOWED", f"allowlisted only for {', '.join(harnesses)}"))
+        elif (why := _matches(s, entry)):
+            found.append(("MISMATCH", why))
+        if s["transport"] == "stdio" and not _pinned(s):
+            found.append(("UNPINNED", "launcher without a fixed package version"))
+        if s["inline_secrets"]:
+            found.append(("INLINE-SECRET", "secret-like value written in config: " + ", ".join(s["inline_secrets"])))
+        if s["trust"] and radius(entry, None) != "read":
+            found.append(("AUTO-APPROVED", "trust: true skips confirmations for a server that is not read-only"))
+        if entry:
+            rb = _date(entry.get("review_by"))
+            if rb and rb < today:
+                found.append(("EXPIRED", f"allowlist review_by {rb} has passed"))
+            if not found and (todo := _unconfirmed(entry)):
+                found.append(("UNCONFIRMED", "allowed, but " + ", ".join(todo) + " not filled in"))
+        if not found:
+            found.append(("OK", f"allowed ({radius(entry, None)})"))
+        for status, detail in found:
+            rows.append({**base, "status": status, "detail": f"{detail} [{target}]",
+                         "enabled": s["enabled"]})
+    for harness, file, server, tool in approvals:
+        if server.startswith("*"):
+            rows.append({"harness": harness, "file": file, "name": server, "status": "AUTO-APPROVED",
+                         "detail": f"{tool} approves tools without asking; irreversible tools need confirmation"})
+            continue
+        entry = entries.get(server)
+        if radius(entry, tool) == "irreversible":
+            what = f"tool {tool}" if tool else "all tools"
+            rows.append({"harness": harness, "file": file, "name": server, "status": "AUTO-APPROVED",
+                         "detail": f"allow rule approves {what} without asking, blast radius irreversible or unknown"})
+    return rows
+
+
+def cmd_mcp_check(a) -> int:
+    home = Path(os.environ.get("AI_GOV_HOME") or Path.home())
+    allow_path = Path(a.allowlist) if a.allowlist else CONF_DIR / "mcp-allowlist.yaml"
+    if not allow_path.is_file():
+        shipped = HERE / "policy" / "mcp-allowlist.yaml"
+        print(f"ai-gov: {allow_path} not found; using the shipped allowlist {shipped}", file=sys.stderr)
+        allow_path = shipped
+    try:
+        allow = load_yaml(allow_path) or {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"ai-gov: cannot read allowlist {allow_path}: {exc}", file=sys.stderr)
+        return 2
+    if str(allow.get("default", "deny")).lower() != "deny":
+        print("ai-gov: allowlist 'default' is not 'deny'; the policy requires default deny", file=sys.stderr)
+    project = Path(a.project).resolve() if a.project else None
+    servers, problems = collect(home, project)
+    rows = evaluate(servers, problems, auto_approvals(home, project), allow, dt.date.today())
+    bad = [r for r in rows if r["status"] in FAIL or (a.strict and r["status"] in WARN)]
+    if a.json:
+        print(json.dumps({"allowlist": str(allow_path), "rows": rows, "failures": len(bad)}, indent=2))
+    elif not rows:
+        print("no MCP servers configured in any known harness location")
+    else:
+        for r in rows:
+            off = "" if r.get("enabled", True) else " (disabled)"
+            print(f"{r['status']:<13} {r['harness']:<24} {r['name']}{off}: {r['detail']}\n{'':14}{r['file']}")
+        print(f"\n{len(servers)} server(s) checked against {allow_path}; {len(bad)} finding(s) to fix")
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------------------- other commands
+
+def cmd_open_questions(a) -> int:
+    files = [Path(f) for f in a.files] or sorted(
+        p for p in CONF_DIR.glob("*") if p.is_file() and p.suffix in (".md", ".yaml", ".yml", ".txt"))
+    if not files:
+        print(f"no policy files found in {CONF_DIR}; install the governance and data-guard modules first")
+        return 0
+    total = 0
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"{f}: {exc}", file=sys.stderr)
+            continue
+        hits = [(i, ln.strip()) for i, ln in enumerate(lines, 1) if "TODO(ask IT)" in ln]
+        if hits:
+            print(f"\n{f} ({len(hits)})")
+            for i, ln in hits:
+                print(f"  {i:>4}: {ln[:160]}")
+        total += len(hits)
+    print(f"\n{total} open question(s) for IT")
+    return 0
+
+
+def cmd_template(a) -> int:
+    path = HERE / "templates" / f"{a.name}.md"
+    if not path.is_file():
+        names = ", ".join(sorted(p.stem for p in (HERE / "templates").glob("*.md")))
+        print(f"ai-gov: unknown template '{a.name}' (one of: {names})", file=sys.stderr)
+        return 2
+    sys.stdout.write(path.read_text(encoding="utf-8"))
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="ai-gov", description="AI governance helpers (work-kit)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("mcp-check", help="flag MCP servers that the allowlist does not allow")
+    s.add_argument("--project", help="also check project-level configs in this directory")
+    s.add_argument("--allowlist", help="default: ~/.config/work-kit/mcp-allowlist.yaml")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--strict", action="store_true", help="warnings (UNCONFIRMED, UNREADABLE) also fail")
+    s.set_defaults(fn=cmd_mcp_check)
+    s = sub.add_parser("open-questions", help="list TODO(ask IT) placeholders in policy files")
+    s.add_argument("files", nargs="*")
+    s.set_defaults(fn=cmd_open_questions)
+    s = sub.add_parser("template", help="print a governance template")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_template)
+    a = p.parse_args(argv)
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

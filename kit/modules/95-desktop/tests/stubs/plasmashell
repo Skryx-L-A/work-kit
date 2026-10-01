@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test stub of plasmashell --version
+echo "plasmashell ${FAKE_PLASMA:-5}.27.12"

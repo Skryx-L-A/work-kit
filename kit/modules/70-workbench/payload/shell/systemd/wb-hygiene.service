@@ -1,0 +1,37 @@
+# wb-hygiene.service -- systemd-user Gegenstueck zum macOS-launchd-Job
+# agent-workbench.wb-hygiene (siehe ../agent-workbench.wb-hygiene.plist). Ruft dieselbe
+# installierte Kopie wie der Mac (~/.local/bin/wb-hygiene --report) und schreibt
+# denselben Bericht an denselben Ort (~/.local/state/wb-hygiene-report.md), den
+# Schritt 2b des session-end-Skills liest.
+#
+# ANLASS (2026-08-22): auf host2 gab es fuer wb-hygiene weder einen systemd-Timer
+# noch einen Cron-Eintrag -- die Statusdatei dort stand deshalb auf dem 4. August,
+# und die Ampel meldete tagelang einen 17 Tage alten Lauf. wb-testsuite hatte
+# schon beides (dieses Verzeichnis, .service + .timer); wb-hygiene fehlte hier
+# vollstaendig.
+#
+# ExecStart zeigt bewusst auf die INSTALLIERTE Kopie unter %h/.local/bin, nicht auf
+# den Repo-Pfad -- anders als bei wb-testsuite.service. wb-hygiene braucht (anders
+# als run-all.sh) keine Geschwister-Dateien relativ zu seinem eigenen Aufrufort;
+# seine eigene REPO_SHELL-Variable zeigt fest auf %h/AI/claude-workbench/shell,
+# unabhaengig davon, von wo aus es selbst gestartet wird (siehe Kopfkommentar
+# shell/wb-hygiene). Die installierte Kopie ist deshalb hier kein Kompromiss.
+#
+# KEIN `bash -lc` noetig (anders als wb-testsuite.service): die Werkzeuge, die
+# wb-hygiene aufruft (wb-consistency, claude-md-lint, status-freshness,
+# wb-speicher), sind Python3-/Bash-Skripte ohne nvm-Abhaengigkeit -- python3 liegt
+# unter /usr/bin, das ein systemd-user-Dienst auch ohne Login-Shell im PATH hat
+# (geprueft 2026-08-22 auf host2: `systemd-run --user --pipe --wait /usr/bin/env`
+# zeigt /usr/bin bereits im PATH). Der npm/nvm-Umweg aus wb-testsuite.service gilt
+# nur fuer den extension/-Check dort, den wb-hygiene nicht hat.
+#
+# Installation: siehe README.md in diesem Ordner.
+
+[Unit]
+Description=wb-hygiene: woechentlicher Lauf der Pruefwerkzeuge (systemd-Gegenstueck zu agent-workbench.wb-hygiene)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wb-hygiene --report
+StandardOutput=append:%h/.local/state/wb-hygiene.log
+StandardError=append:%h/.local/state/wb-hygiene.log

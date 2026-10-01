@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Workbench harness updater: catalogue checks and session-safe updates.
+
+The updater never guesses a package source.  Each supported harness has one
+measured installation path below.  In-place package managers are blocked while
+a matching local Workbench session is alive; versioned native/Homebrew paths
+may switch while an old process keeps running.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Harness:
+    id: str
+    binary: str
+    installed_args: tuple[str, ...]
+    way: str
+    catalog: str
+    package: str
+    update: tuple[str, ...]
+    safe_while_running: bool = False
+
+
+HARNESSES: tuple[Harness, ...] = (
+    Harness("claude", "claude", ("--version",), "native-versioned", "npm", "@anthropic-ai/claude-code", ("claude", "update"), True),
+    Harness("codex", "codex", ("--version",), "npm-global", "npm", "@openai/codex", ("npm", "install", "-g", "@openai/codex@latest")),
+    Harness("opencode", "opencode", ("--version",), "npm-global", "npm", "opencode-ai", ("npm", "install", "-g", "opencode-ai@latest")),
+    Harness("pi", "pi", ("--version",), "npm-global", "npm", "@earendil-works/pi-coding-agent", ("npm", "install", "-g", "@earendil-works/pi-coding-agent@latest")),
+    Harness("copilot", "copilot", ("--version",), "npm-global", "npm", "@github/copilot", ("npm", "install", "-g", "@github/copilot@latest")),
+    Harness("aider", "aider", ("--version",), "uv-tool", "pypi", "aider-chat", ("uv", "tool", "upgrade", "aider-chat")),
+    # Kit: the adapters the kit does not ship (agy, goose, crush, qwen, kimi, gptme, cline) are not updated here.
+)
+
+BY_ID = {h.id: h for h in HARNESSES}
+VERSION_RE = re.compile(r"(?<!\d)v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)")
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def state_file() -> Path:
+    override = os.environ.get("WB_HARNESS_UPDATE_STATE_FILE")
+    return Path(override).expanduser() if override else user_home() / ".local" / "state" / "wb-harness-update.json"
+
+
+def log_file() -> Path:
+    override = os.environ.get("WB_HARNESS_UPDATE_LOG_FILE")
+    return Path(override).expanduser() if override else user_home() / ".local" / "state" / "wb-harness-update.log"
+
+
+def settings_file() -> Path:
+    return Path(os.environ.get("AWB_SETTINGS_FILE", "~/.claude/workbench/settings.json")).expanduser()
+
+
+def sessions_dir() -> Path:
+    return Path(os.environ.get("WB_HARNESS_UPDATE_SESSIONS_DIR", "~/.claude/workbench/sessions")).expanduser()
+
+
+def models_file() -> Path:
+    return Path(os.environ.get("WB_MODELS_FILE", "~/.claude/workbench/models.json")).expanduser()
+
+
+def run(argv: tuple[str, ...] | list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+        "NPM_CONFIG_FUND": "false",
+        "NPM_CONFIG_AUDIT": "false",
+    })
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def extract_version(text: str) -> str:
+    m = VERSION_RE.search(text)
+    return m.group(1) if m else ""
+
+
+@dataclass(frozen=True)
+class VersionProbe:
+    version: str | None
+    error: str | None = None
+
+
+def user_home() -> Path:
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError, AttributeError):
+        return Path.home()
+
+
+def expand_user_path(value: str) -> Path:
+    if value == "~":
+        return user_home()
+    if value.startswith("~/"):
+        return user_home() / value[2:]
+    return Path(value).expanduser()
+
+
+def registry_command(h: Harness) -> str | None:
+    p = run(("wb-state", "harness", "get", h.id), timeout=15)
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except (ValueError, TypeError):
+        return None
+    command = data.get("command") if isinstance(data, dict) else None
+    return command if isinstance(command, str) and command else None
+
+
+def program_path(h: Harness) -> str | None:
+    configured = registry_command(h)
+    candidates: list[str] = []
+    if configured:
+        configured_path = expand_user_path(configured)
+        if os.path.sep in configured:
+            candidates.append(str(configured_path))
+        else:
+            candidates.append(configured)
+    found = shutil.which(configured or h.binary)
+    if found:
+        candidates.append(found)
+    home = user_home()
+    candidates.extend([
+        str(home / ".local" / "bin" / h.binary),
+        f"/opt/homebrew/bin/{h.binary}",
+        f"/usr/local/bin/{h.binary}",
+        str(home / ".local" / "share" / "uv" / "tools" / h.package / "bin" / h.binary),
+    ])
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.sep not in candidate:
+            candidate = shutil.which(candidate) or ""
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def installed(h: Harness) -> VersionProbe:
+    path = program_path(h)
+    if path is None:
+        return VersionProbe(None)
+    p = run((path, *h.installed_args), timeout=15)
+    output = (p.stdout or "") + "\n" + (p.stderr or "")
+    version = extract_version(output)
+    if p.returncode != 0:
+        detail = (p.stderr or p.stdout or "").strip() or f"Exit {p.returncode}"
+        return VersionProbe(None, detail)
+    if not version:
+        return VersionProbe(None, "keine Versionsnummer in der Ausgabe")
+    return VersionProbe(version)
+
+
+def latest(h: Harness) -> tuple[str, str]:
+    if h.catalog == "npm":
+        p = run(("npm", "view", h.package, "version"), timeout=30)
+        return (extract_version(p.stdout), p.stderr.strip()) if p.returncode == 0 else ("", p.stderr.strip() or p.stdout.strip())
+    if h.catalog == "brew":
+        p = run(("brew", "info", "--json=v2", h.package), timeout=60)
+        if p.returncode != 0:
+            return "", p.stderr.strip() or p.stdout.strip()
+        try:
+            data = json.loads(p.stdout)
+            return str(data["formulae"][0]["versions"]["stable"]), ""
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            return "", f"brew JSON unlesbar: {exc}"
+    if h.catalog == "pypi":
+        p = run(("curl", "-fsSL", "--max-time", "20", f"https://pypi.org/pypi/{h.package}/json"), timeout=25)
+        if p.returncode != 0:
+            return "", p.stderr.strip() or p.stdout.strip()
+        try:
+            return str(json.loads(p.stdout)["info"]["version"]), ""
+        except (ValueError, KeyError, TypeError) as exc:
+            return "", f"PyPI JSON unlesbar: {exc}"
+    return "", "unbekannter Katalog"
+
+
+def numeric_version(value: str) -> tuple[int, ...]:
+    m = re.match(r"^v?(\d+(?:\.\d+){1,3})", value)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def outdated(before: str, newest: str) -> bool:
+    a, b = numeric_version(before), numeric_version(newest)
+    if a and b:
+        width = max(len(a), len(b))
+        return a + (0,) * (width - len(a)) < b + (0,) * (width - len(b))
+    return bool(before and newest and before != newest)
+
+
+def auto_enabled() -> bool:
+    try:
+        data = json.loads(settings_file().read_text())
+    except (OSError, ValueError):
+        return True
+    value = data.get("harnessUpdateAuto") if isinstance(data, dict) else None
+    return value is not False
+
+
+def read_previous() -> dict[str, Any]:
+    try:
+        data = json.loads(state_file().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(name, path)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def append_log(line: str) -> None:
+    path = log_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{now()} {line}\n")
+
+
+def test_environment_reason() -> str | None:
+    # AWB_CONTROL_SOCKET and the two Mantel variables are production inputs
+    # from Kernstart.swift, not test markers.  AWB_MODELS_FILE is the isolated
+    # registry override used by tests/dev runs; HOME and the explicit test
+    # prefixes remain the fail-closed boundary for anwenden.
+    expected = str(user_home())
+    actual = os.environ.get("HOME", "")
+    if actual != expected:
+        return f"HOME ist nicht das Benutzer-Home ({actual or 'nicht gesetzt'} statt {expected})"
+    markers = ("AWB_MODELS_FILE",)
+    for name in markers:
+        if name in os.environ:
+            return f"Testmarker {name} gesetzt"
+    for name in os.environ:
+        if name.startswith("AWB_TEST") or name.startswith("WB_TEST_"):
+            return f"Testmarker {name} gesetzt"
+    return None
+
+
+def lock_path() -> Path:
+    override = os.environ.get("WB_HARNESS_UPDATE_LOCK_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path("/tmp") / f"wb-harness-update-{os.getuid()}.lock"
+
+
+def package_lock_path(way: str) -> Path:
+    override_dir = os.environ.get("WB_HARNESS_UPDATE_PACKAGE_LOCK_DIR")
+    directory = Path(override_dir) if override_dir else Path("/tmp")
+    return directory / f"wb-harness-update-{os.getuid()}-{way}.lock"
+
+
+def acquire_lock(path: Path) -> tuple[Any, bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return fh, False
+    return fh, True
+
+
+def release_lock(fh: Any) -> None:
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def tmux_session_alive(name: str) -> bool | None:
+    if not name:
+        return False
+    if shutil.which("tmux") is None:
+        return None
+    p = run(("tmux", "has-session", "-t", name), timeout=5)
+    if p.returncode == 0:
+        return True
+    text = (p.stderr + p.stdout).lower()
+    if "no server running" in text or "can't find session" in text or "no such file" in text:
+        return False
+    return None
+
+
+def live_sessions(harness: str) -> tuple[int, bool]:
+    """Return (matching live panes/sessions, measurement_unknown)."""
+    directory = sessions_dir()
+    if not directory.is_dir():
+        return 0, False
+    count = 0
+    unknown = False
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        session = str(data.get("tmuxSession") or "")
+        alive = tmux_session_alive(session)
+        relevant = str(data.get("harness") or "claude") == harness
+        workers = [w for w in data.get("workers", []) if isinstance(w, dict) and str(w.get("kind") or "") == harness and not w.get("machine")]
+        if not relevant and not workers:
+            continue
+        if alive is None:
+            unknown = True
+            continue
+        if alive:
+            count += (1 if relevant else 0) + len(workers)
+    return count, unknown
+
+
+def needs_harness_config(harness: str) -> bool:
+    p = run(("wb-state", "harness", "get", harness), timeout=15)
+    if p.returncode != 0:
+        return False
+    try:
+        data = json.loads(p.stdout)
+        return isinstance(data.get("configFiles"), list) and bool(data["configFiles"])
+    except (ValueError, AttributeError):
+        return False
+
+
+def after_update(h: Harness) -> list[str]:
+    notes: list[str] = []
+    discover = run(("wb-state", "models", "discover", h.id, "--force"), timeout=120)
+    if discover.returncode != 0:
+        notes.append("Modelldiscovery nicht verfügbar: " + (discover.stderr.strip() or discover.stdout.strip() or str(discover.returncode)))
+    if needs_harness_config(h.id):
+        config = run(("wb-harness-config", "apply", h.id), timeout=60)
+        if config.returncode != 0:
+            notes.append("Harness-Konfiguration fehlgeschlagen: " + (config.stderr.strip() or config.stdout.strip() or str(config.returncode)))
+    return notes
+
+
+def rollback(h: Harness, before: str) -> tuple[bool, str]:
+    if h.catalog == "npm":
+        command = ("npm", "install", "-g", f"{h.package}@{before}")
+    elif h.catalog == "pypi":
+        command = ("uv", "tool", "install", "--reinstall", f"{h.package}=={before}")
+    elif h.catalog == "brew":
+        command = ("brew", "link", "--overwrite", h.package)
+    else:
+        return False, "kein Rueckweg fuer diesen Installationsweg"
+    p = run(command, timeout=900)
+    if p.returncode != 0:
+        return False, p.stderr.strip() or p.stdout.strip() or f"Exit {p.returncode}"
+    restored = installed(h)
+    if restored.version != before:
+        return False, f"Version nach Ruecksetzung {restored.version or 'unbekannt'} statt {before}"
+    return True, " ".join(command)
+
+
+def failed_update(h: Harness, before: str, detail: str, rec: dict[str, Any]) -> None:
+    rec["notes"] = [detail]
+    # A failed in-place update can leave npm/uv's executable directory empty.  A
+    # start probe is deliberately made before deciding whether restoration is
+    # necessary; a still-running old process is not evidence that the install is
+    # healthy.
+    if h.way in ("npm-global", "uv-tool", "brew-cellar"):
+        current = installed(h)
+        if current.version is None:
+            restored, restore_detail = rollback(h, before)
+            if restored:
+                rec["status"] = "Update fehlgeschlagen, zurueckgesetzt"
+                rec["installedAfter"] = before
+                rec["notes"].append("Vorherige Version wiederhergestellt: " + restore_detail)
+                append_log(f"{h.id}: fehlgeschlagen, zurueckgesetzt ({restore_detail})")
+                return
+            rec["notes"].append("Ruecksetzung fehlgeschlagen: " + restore_detail)
+    rec["status"] = "Update fehlgeschlagen"
+    append_log(f"{h.id}: FEHLER: {detail}")
+
+
+def record_for(h: Harness, allow_network: bool, apply: bool) -> tuple[dict[str, Any], bool]:
+    before_probe = installed(h)
+    before = before_probe.version
+    live, unknown = live_sessions(h.id)
+    rec: dict[str, Any] = {
+        "harness": h.id,
+        "installedBefore": before or None,
+        "installedAfter": before or None,
+        "latest": None,
+        "way": h.way,
+        "updateCommand": list(h.update),
+        "liveSessions": live,
+        "sessionStateUnknown": unknown,
+        "pending": False,
+        "status": "",
+        "notes": [],
+    }
+    if not allow_network:
+        cached = next((x for x in read_previous().get("harnesses", []) if x.get("harness") == h.id), {})
+        rec["latest"] = cached.get("latest")
+        rec["status"] = "Automatik aus; kein Netzabruf"
+        return rec, True
+    if before_probe.error:
+        rec["status"] = f"unbekannt (Probe fehlgeschlagen: {before_probe.error})"
+        rec["notes"] = [before_probe.error]
+        return rec, False
+    newest, error = latest(h)
+    rec["latest"] = newest or None
+    if error or not newest:
+        rec["status"] = "Katalogabfrage fehlgeschlagen"
+        rec["notes"] = [error or "keine Version im Katalog"]
+        return rec, False
+    if not before:
+        rec["status"] = "nicht installiert"
+        return rec, True
+    if not outdated(before, newest):
+        rec["status"] = "aktuell"
+        return rec, True
+    if (live > 0 or unknown) and not h.safe_while_running:
+        rec["pending"] = True
+        rec["status"] = f"vorgemerkt: {live} Sitzung(en) laufen" if live else "vorgemerkt: Sitzungsstand nicht sicher messbar"
+        return rec, True
+    if not apply:
+        rec["status"] = "Update jetzt möglich"
+        return rec, True
+    package_lock, acquired = acquire_lock(package_lock_path(h.catalog))
+    if not acquired:
+        rec["pending"] = True
+        rec["status"] = f"vorgemerkt: Paketweg {h.catalog} ist gesperrt"
+        return rec, False
+    try:
+        append_log(f"{h.id}: Update {before} -> {newest}: {' '.join(h.update)}")
+        p = run(h.update, timeout=900)
+        if p.returncode != 0:
+            detail = p.stderr.strip() or p.stdout.strip() or f"Exit {p.returncode}"
+            rec["pending"] = "permission denied" in detail.lower() or "eacces" in detail.lower()
+            if rec["pending"]:
+                if installed(h).version is None:
+                    failed_update(h, before, detail, rec)
+                else:
+                    rec["status"] = "vorgemerkt: Schreibrechte fehlen"
+                    rec["notes"] = [detail]
+                    append_log(f"{h.id}: FEHLER: {detail}")
+            else:
+                failed_update(h, before, detail, rec)
+            return rec, False
+        after_probe = installed(h)
+        after = after_probe.version
+        rec["installedAfter"] = after or None
+        if not after or outdated(after, newest):
+            detail = f"nach Update {after or 'nicht lesbar'}, erwartet {newest}"
+            failed_update(h, before, detail, rec)
+            return rec, False
+    finally:
+        release_lock(package_lock)
+    rec["status"] = "aktualisiert"
+    rec["notes"] = after_update(h)
+    append_log(f"{h.id}: aktualisiert {before} -> {after}" + (f"; {'; '.join(rec['notes'])}" if rec["notes"] else ""))
+    return rec, True
+
+
+def usage() -> int:
+    print("Aufruf: wb-harness-update pruefen [--json] [--force]\n"
+          "        wb-harness-update anwenden [<harness> ...|--all] [--json] [--force]", file=sys.stderr)
+    return 2
+
+
+def print_table(records: list[dict[str, Any]]) -> None:
+    headers = ("Harness", "Installiert", "Neueste", "Weg", "Stand")
+    rows = [headers] + [(
+        str(r["harness"]), str(r["installedAfter"] or "-"), str(r["latest"] or "-"),
+        str(r["way"]), str(r["status"]),
+    ) for r in records]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
+    for n, row in enumerate(rows):
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+        if n == 0:
+            print("  ".join("-" * w for w in widths))
+
+
+def skipped_test_record(h: Harness, reason: str) -> dict[str, Any]:
+    return {
+        "harness": h.id,
+        "installedBefore": None,
+        "installedAfter": None,
+        "latest": None,
+        "way": h.way,
+        "updateCommand": list(h.update),
+        "liveSessions": 0,
+        "sessionStateUnknown": False,
+        "pending": False,
+        "status": "uebersprungen: Testumgebung",
+        "notes": [reason],
+    }
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] not in ("pruefen", "anwenden"):
+        return usage()
+    action = argv.pop(0)
+    json_out = "--json" in argv
+    force = "--force" in argv
+    all_flag = "--all" in argv
+    names = [x for x in argv if not x.startswith("--")]
+    if action == "pruefen" and (names or all_flag):
+        return usage()
+    if action == "anwenden" and not names and not all_flag:
+        return usage()
+    if all_flag and names:
+        return usage()
+    selected = list(HARNESSES) if action == "pruefen" or all_flag else []
+    if names:
+        unknown = [name for name in names if name not in BY_ID]
+        if unknown:
+            print("Unbekannte Harnesses: " + ", ".join(unknown), file=sys.stderr)
+            return 2
+        selected = [BY_ID[name] for name in names]
+
+    if action == "anwenden" and not force:
+        reason = test_environment_reason()
+        if reason:
+            records = [skipped_test_record(h, reason) for h in selected]
+            result = {
+                "checkedAt": now(),
+                "action": action,
+                "autoEnabled": auto_enabled(),
+                "forced": False,
+                "harnesses": records,
+            }
+            write_json_atomic(state_file(), result)
+            append_log("Lauf uebersprungen: Testumgebung — " + reason)
+            if json_out:
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            else:
+                print_table(records)
+            return 0
+
+    lock, acquired = acquire_lock(lock_path())
+    if not acquired:
+        print("wb-harness-update: bereits ein Lauf aktiv", file=sys.stderr)
+        return 3
+    try:
+        enabled = auto_enabled() or force
+        records: list[dict[str, Any]] = []
+        ok = True
+        for h in selected:
+            rec, one_ok = record_for(h, enabled, action == "anwenden")
+            records.append(rec)
+            ok = ok and one_ok
+        result = {
+            "checkedAt": now(),
+            "action": action,
+            "autoEnabled": auto_enabled(),
+            "forced": force,
+            "harnesses": records,
+        }
+        write_json_atomic(state_file(), result)
+        if action == "anwenden":
+            append_log(f"Lauf beendet: {sum(r['status'] == 'aktualisiert' for r in records)} aktualisiert, "
+                       f"{sum(bool(r['pending']) for r in records)} vorgemerkt, "
+                       f"{sum('fehlgeschlagen' in str(r['status']).lower() for r in records)} fehlgeschlagen")
+        if json_out:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            print_table(records)
+        return 0 if ok else 1
+    finally:
+        release_lock(lock)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""kit-profiles: role prompts, guard hooks, session context and status line for every harness.
+
+  profiles-setup install [--dry-run] [--all | --harness LIST] [--role lead|worker|none]
+                         [--orchestration auto|workbench|delegate|none]
+                         [--no-guard] [--no-context] [--no-statusline]
+  profiles-setup uninstall [--dry-run]
+  profiles-setup status
+  profiles-setup role [lead|worker] [--orchestration ...]      print the rendered role prompt
+
+Harnesses: claude codex gemini copilot cursor opencode pi aider continue. Without --all or
+--harness, only detected harnesses (config dir or binary present) are set up. What is written where:
+docs/harness-profiles.md of the kit repository. Every file is backed up before a change
+(<file>.bak-<timestamp> below ~/.local/share/work-kit/backups/32-harness-profiles/, same path as
+below $HOME); text outside the kit's own entries and blocks is never touched, and
+uninstall removes only what this module added. Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HARNESSES = ("claude", "codex", "gemini", "copilot", "cursor", "opencode", "pi", "aider", "continue")
+MARK = "harness-profiles"            # every hook command we write contains this (install dir name)
+BEGIN = "<!-- work-kit-profiles:begin - managed by 32-harness-profiles, remove with its uninstall.sh -->"
+END = "<!-- work-kit-profiles:end -->"
+BLOCK_RE = re.compile(r"<!-- work-kit-profiles:begin.*?-->.*?<!-- work-kit-profiles:end -->\n?", re.S)
+TOML_BEGIN = "# work-kit-profiles:begin - managed by 32-harness-profiles"
+TOML_END = "# work-kit-profiles:end"
+TOML_RE = re.compile(r"# work-kit-profiles:begin.*?# work-kit-profiles:end\n?", re.S)
+MANAGED = "managed by work-kit 32-harness-profiles"
+VARIANT_RE = re.compile(r"<!-- variant:(\w+) -->\n(.*?)<!-- /variant -->\n", re.S)
+
+
+class Ctx:
+    def __init__(self, dry_run: bool):
+        self.home = Path(os.environ.get("HOME") or Path.home())
+        self.dry_run = dry_run
+        self.stamp = time.strftime("%Y%m%d%H%M%S")
+        self.data = Path(os.environ.get("KIT_DATA_DIR") or self.home / ".local/share/work-kit")
+        self.dest = self.data / "harness-profiles"
+        self.bin = Path(os.environ.get("KIT_BIN_DIR") or self.home / ".local/bin")
+        cfg = os.environ.get("XDG_CONFIG_HOME") or str(self.home / ".config")
+        self.conf_dir = Path(cfg) / "work-kit"
+        self.xdg = Path(cfg)
+        self.backed_up: set[Path] = set()
+
+    def say(self, action: str, path, note: str = "") -> None:
+        writes = {"create", "update", "remove", "backup", "link"}
+        prefix = "would " if self.dry_run and action in writes else ""
+        print("[%s%s] %s%s" % (prefix, action, path, ("  (%s)" % note) if note else ""))
+
+    def backup(self, path: Path) -> None:
+        if path in self.backed_up or not path.exists():
+            return
+        self.backed_up.add(path)
+        dest = self.backup_dest(path)
+        self.say("backup", path, "-> " + str(dest))
+        if not self.dry_run:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+
+    def backup_dest(self, path: Path) -> Path:
+        """Backups live below the kit's data dir, never next to the user's file."""
+        path = Path(os.path.abspath(path))
+        try:
+            rel = path.relative_to(self.home)
+        except ValueError:
+            rel = Path("_root") / path.relative_to(path.anchor)
+        return self.data / "backups" / "32-harness-profiles" / rel.parent / (rel.name + ".bak-" + self.stamp)
+
+    def write(self, path: Path, text: str, note: str = "") -> bool:
+        old = path.read_text(encoding="utf-8") if path.is_file() else None
+        if old == text:
+            self.say("ok", path, "unchanged")
+            return False
+        if old is not None:
+            self.backup(path)
+        self.say("update" if old is not None else "create", path, note)
+        if not self.dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")  # in place: an existing file keeps its mode
+            if old is None:
+                path.chmod(0o644)
+        return True
+
+    def remove(self, path: Path, note: str = "") -> None:
+        if not (path.exists() or path.is_symlink()):
+            return
+        # kit files carry "work-kit"; anything else was edited or replaced by the user: keep a copy
+        if path.is_file() and not path.is_symlink() and "work-kit" not in path.read_text(errors="replace"):
+            self.backup(path)
+        self.say("remove", path, note)
+        if not self.dry_run:
+            path.unlink()
+
+    # helper commands (launchers in ~/.local/bin pick python at run time)
+    def tool(self, name: str) -> str:
+        return str(self.bin / name)
+
+
+def q(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'" if re.search(r"[^\w@%+=:,./-]", s) else s
+
+
+# --- roles ----------------------------------------------------------------------------------
+
+def detect_orchestration(ctx: Ctx) -> str:
+    if shutil.which("wb-code") or (ctx.data / "workbench/manifest.json").is_file():
+        return "workbench"
+    if shutil.which("agent-spawn") or (ctx.bin / "agent-spawn").exists():
+        return "delegate"
+    return "none"
+
+
+def render_role(role: str, orchestration: str) -> str:
+    src = HERE / "roles-src" if (HERE / "roles-src").is_dir() else HERE / "roles"  # installed copy / repo
+    text = (src / ("%s.md" % role)).read_text(encoding="utf-8")
+    return VARIANT_RE.sub(lambda m: m.group(2) if m.group(1) == orchestration else "", text).strip() + "\n"
+
+
+# --- generic file helpers -------------------------------------------------------------------
+
+def load_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        # JSON with comments (VS Code, Gemini allow it): strip // and /* */ outside strings is too
+        # risky to do blindly; refuse instead of rewriting a file we cannot read.
+        raise SystemExit("[profiles] ERROR: %s is not plain JSON; fix it or edit it by hand" % path)
+    if not isinstance(data, dict):
+        raise SystemExit("[profiles] ERROR: %s does not hold a JSON object" % path)
+    return data
+
+
+def dump_json(data: dict) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+# --- Aider read: list -------------------------------------------------------------------------
+# Kit modules that add a file to the read: list of ~/.aider.conf.yml tag their line with a comment
+# "# work-kit-<module> ..."; kit-sync (30-agent-setup) carries such lines when it rebuilds its region.
+
+def read_list_put(text: str, entry: str, mark: str):
+    """text with '  - ENTRY  MARK' in the top-level read: list (list created when missing); a line
+    with MARK that is already there is updated in place. None when read: is a non-empty inline list."""
+    line = "  - %s  %s" % (entry, mark)
+    lines = text.splitlines()
+    marked = [i for i, ln in enumerate(lines) if mark in ln and ln.lstrip().startswith("-")]
+    if marked:
+        lines[marked[0]] = line
+        for i in reversed(marked[1:]):
+            del lines[i]
+        return "\n".join(lines) + "\n"
+    m = re.search(r"(?m)^read:[ \t]*(.*)$", text)
+    if m is None:
+        return text + ("" if not text or text.endswith("\n") else "\n") + "read:\n" + line + "\n"
+    value = m.group(1).strip()
+    if value == "":  # block list: append after its last item
+        end = m.end()
+        for item in re.finditer(r"\n([ \t]*-[^\n]*)", text[m.end():]):
+            if item.start() != end - m.end():
+                break
+            end = m.end() + item.end()
+        return text[:end] + "\n" + line + text[end:]
+    if value == "[]":
+        return text[:m.start()] + "read:\n" + line + text[m.end():]
+    if value.startswith("["):
+        return None
+    return text[:m.start()] + "read:\n  - %s\n%s" % (value, line) + text[m.end():]  # single value -> block list
+
+
+def read_list_drop(text: str, mark: str) -> str:
+    """text without the lines carrying MARK; a read: key left without items goes with them."""
+    lines = [ln for ln in text.splitlines() if not (mark in ln and ln.lstrip().startswith("-"))]
+    if len(lines) == len(text.splitlines()):
+        return text
+    out = []
+    for i, ln in enumerate(lines):
+        if re.match(r"^read:[ \t]*$", ln) and not (i + 1 < len(lines) and re.match(r"^[ \t]*-", lines[i + 1])):
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def upsert_block(text: str, body: str) -> str:
+    block = "%s\n%s\n%s\n" % (BEGIN, body.strip(), END)
+    if BLOCK_RE.search(text):
+        return BLOCK_RE.sub(lambda _m: block, text, count=1)
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+
+
+def is_ours(cmd) -> bool:
+    return isinstance(cmd, str) and any(x in cmd for x in (MARK, "kit-guard", "kit-context", "kit-statusline"))
+
+
+def hook_cmd(entry: dict) -> str:
+    return str(entry.get("command") or entry.get("bash") or "")
+
+
+def merge_hooks(hooks: dict, event: str, matcher: str | None, command: str, extra: dict | None = None) -> None:
+    """Claude/Codex/Gemini shape {event: [{matcher?, hooks: [{type, command, ...}]}]}. Callers strip the
+    kit's old entries first (strip_hooks), so this only appends."""
+    entry = {"type": "command", "command": command}
+    entry.update(extra or {})
+    group = {"hooks": [entry]} if matcher is None else {"matcher": matcher, "hooks": [entry]}
+    hooks.setdefault(event, []).append(group)
+
+
+def strip_hooks(hooks: dict) -> None:
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        keep = []
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g["hooks"] = [h for h in g["hooks"] if not is_ours(hook_cmd(h))]
+                if g["hooks"]:
+                    keep.append(g)
+            elif isinstance(g, dict) and is_ours(hook_cmd(g)):
+                continue  # flat entry (cursor, copilot)
+            else:
+                keep.append(g)
+        if keep:
+            hooks[event] = keep
+        else:
+            del hooks[event]
+
+
+def has_foreign_bash_guard(hooks: dict) -> bool:
+    for g in hooks.get("PreToolUse", []) or []:
+        for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+            c = hook_cmd(h)
+            if "bash-guard" in c and not is_ours(c):
+                return True
+    return False
+
+
+# --- detection ------------------------------------------------------------------------------
+
+def detected(ctx: Ctx) -> list[str]:
+    h = ctx.home
+    probes = {
+        "claude": (h / ".claude", "claude"),
+        "codex": (Path(os.environ.get("CODEX_HOME") or h / ".codex"), "codex"),
+        "gemini": (h / ".gemini", "gemini"),
+        "copilot": (h / ".copilot", "copilot"),
+        "cursor": (h / ".cursor", "cursor-agent"),
+        "opencode": (ctx.xdg / "opencode", "opencode"),
+        "pi": (h / ".pi", "pi"),
+        "aider": (h / ".aider.conf.yml", "aider"),
+        "continue": (h / ".continue", "cn"),
+    }
+    aider_dir = h / ".aider"  # 30-agent-setup and 31-caveman detect Aider by this directory as well
+    return [n for n, (p, b) in probes.items()
+            if p.exists() or shutil.which(b) or (n == "aider" and aider_dir.exists())]
+
+
+# --- per harness ----------------------------------------------------------------------------
+
+class Setup:
+    def __init__(self, ctx: Ctx, role: str, orchestration: str, guard: bool, context: bool, statusline: bool):
+        self.ctx, self.role, self.orch = ctx, role, orchestration
+        self.guard, self.context, self.statusline = guard, context, statusline
+        self.roles_dir = ctx.dest / "roles"
+
+    def role_file(self, role: str | None = None) -> Path:
+        return self.roles_dir / ("%s.md" % (role or self.role))
+
+    def text(self, role: str | None = None) -> str:
+        return render_role(role or self.role, self.orch)
+
+    def fast(self, name: str, script: str, args: str) -> str:
+        """Claude Code hook command. The ~/.local/bin launcher probes for python on every call, one
+        interpreter start more per hook; Claude Code runs hook commands in a shell, so the interpreter
+        this install runs under starts the script directly, and the launcher stays the fallback."""
+        launcher = ("%s %s" % (q(self.ctx.tool(name)), args)).strip()
+        py, src = sys.executable, self.ctx.dest / script
+        if not py or not os.path.isabs(py):
+            return launcher
+        return "[ -x %s ] && exec %s %s %s; exec %s" % (q(py), q(py), q(str(src)), args, launcher)
+
+    def gc(self, harness: str, event: str, *extra: str) -> str:
+        if harness == "claude":
+            return self.fast("kit-context", "context/kit-context", " ".join(["hook", harness, event] + list(extra)))
+        return " ".join([q(self.ctx.tool("kit-context")), "hook", harness, event] + list(extra))
+
+    def gg(self, harness: str) -> str:
+        if harness == "claude":
+            return self.fast("kit-guard", "guard/kit-guard", "hook claude")
+        return "%s hook %s" % (q(self.ctx.tool("kit-guard")), harness)
+
+    def gp(self, harness: str) -> str:
+        if harness == "claude":
+            return self.fast("kit-guard", "guard/kit-guard", "post claude")
+        return "%s post %s" % (q(self.ctx.tool("kit-guard")), harness)
+
+    # Claude Code ---------------------------------------------------------------------------
+    def claude(self, remove: bool = False) -> None:
+        ctx, base = self.ctx, Path(os.environ.get("CLAUDE_CONFIG_DIR") or self.ctx.home / ".claude")
+        path = base / "settings.json"
+        data = load_json(path)
+        hooks = data.setdefault("hooks", {})
+        strip_hooks(hooks)
+        styles = base / "output-styles"
+        for r in ("lead", "worker"):
+            f = styles / ("kit-%s.md" % r)
+            if remove or self.role == "none":
+                ctx.remove(f)
+            else:
+                body = self.text(r)
+                ctx.write(f, "---\nname: kit-%s\ndescription: work-kit %s role (%s)\nkeep-coding-instructions: true\n"
+                          "---\n\n%s" % (r, r, MANAGED, body))
+        if data.get("outputStyle", "").startswith("kit-") or "outputStyle" not in data:
+            if remove or self.role == "none":
+                data.pop("outputStyle", None)
+            else:
+                data["outputStyle"] = "kit-%s" % self.role
+        else:
+            ctx.say("note", path, "outputStyle %r is set by you; kit role not selected (use /output-style kit-%s)"
+                    % (data["outputStyle"], self.role))
+        if not remove:
+            if self.guard:
+                # One Bash guard: the workbench's bash-guard.py (70-workbench) runs kit-guard's checks
+                # in its own process, so kit-guard's PreToolUse entry would only check twice.
+                if has_foreign_bash_guard(hooks):
+                    ctx.say("note", path, "a workbench bash guard is registered already and runs kit-guard's "
+                            "checks; kit-guard's PreToolUse hook not added")
+                else:
+                    merge_hooks(hooks, "PreToolUse", "Bash", self.gg("claude"), {"timeout": 60})
+                merge_hooks(hooks, "PreToolUse", "Write|Edit|MultiEdit", self.gg("claude"), {"timeout": 60})
+                merge_hooks(hooks, "PostToolUse", "Bash", self.gp("claude"), {"timeout": 60})
+            if self.context:
+                merge_hooks(hooks, "SessionStart", None, self.gc("claude", "session"), {"timeout": 60})
+                merge_hooks(hooks, "UserPromptSubmit", None, self.gc("claude", "prompt"), {"timeout": 60})
+        if not hooks:
+            data.pop("hooks", None)
+        sl = data.get("statusLine")
+        caveman_sl = ctx.data / "caveman/upstream/src/hooks/caveman-statusline.sh"
+        ours = isinstance(sl, dict) and is_ours(str(sl.get("command", "")))
+        if remove or not self.statusline:
+            if ours:
+                if caveman_sl.is_file():
+                    data["statusLine"] = {"type": "command", "command": 'bash "%s"' % caveman_sl}
+                else:
+                    del data["statusLine"]
+        elif sl is None or ours or (isinstance(sl, dict) and "caveman-statusline.sh" in str(sl.get("command", ""))):
+            data["statusLine"] = {"type": "command", "command": self.fast("kit-statusline", "statusline/kit-statusline", ""),
+                                  "padding": 0}
+        else:
+            ctx.say("note", path, "statusLine is set by you; kept (kit-statusline not added)")
+        if data or path.exists():
+            ctx.write(path, dump_json(data))
+
+    # Codex ---------------------------------------------------------------------------------
+    def codex(self, remove: bool = False) -> None:
+        ctx = self.ctx
+        base = Path(os.environ.get("CODEX_HOME") or ctx.home / ".codex")
+        hpath = base / "hooks.json"
+        data = load_json(hpath)
+        hooks = data.setdefault("hooks", {})
+        strip_hooks(hooks)
+        if not remove:
+            if self.guard:
+                merge_hooks(hooks, "PreToolUse", "Bash", self.gg("codex"), {"timeout": 60})
+                merge_hooks(hooks, "PostToolUse", "Bash", self.gp("codex"), {"timeout": 60})
+            if self.context:
+                merge_hooks(hooks, "SessionStart", "startup|resume", self.gc("codex", "session"), {"timeout": 60})
+                merge_hooks(hooks, "UserPromptSubmit", None, self.gc("codex", "prompt"), {"timeout": 60})
+        if not hooks:
+            data.pop("hooks", None)
+        if data:
+            ctx.write(hpath, dump_json(data))
+        elif hpath.is_file():
+            ctx.remove(hpath, "only kit hooks were in it")
+        # role: developer_instructions adds to Codex's own instructions (model_instructions_file would replace them)
+        cpath = base / "config.toml"
+        text = cpath.read_text(encoding="utf-8") if cpath.is_file() else ""
+        new = TOML_RE.sub("", text)
+        if not remove and self.role != "none":
+            outside = re.search(r"(?m)^\s*developer_instructions\s*=", new.split("\n[", 1)[0])
+            if outside:
+                ctx.say("note", cpath, "developer_instructions is set by you; kit role not added")
+            else:
+                body = self.text().replace("'''", "'' '")
+                new = "%s\ndeveloper_instructions = '''\n%s'''\n%s\n" % (TOML_BEGIN, body, TOML_END) + new
+        if new != text:
+            ctx.write(cpath, new, "role %s" % self.role)
+        for r in ("lead", "worker"):
+            prof = base / ("kit-%s.config.toml" % r)
+            if remove or self.role == "none":
+                ctx.remove(prof)
+            else:
+                body = self.text(r).replace("'''", "'' '")
+                ctx.write(prof, "# %s; start with: codex --profile kit-%s\ndeveloper_instructions = '''\n%s'''\n"
+                          % (MANAGED, r, body))
+
+    # Gemini CLI ----------------------------------------------------------------------------
+    def gemini(self, remove: bool = False) -> None:
+        ctx, path = self.ctx, self.ctx.home / ".gemini/settings.json"
+        data = load_json(path)
+        hooks = data.setdefault("hooks", {})
+        strip_hooks(hooks)
+        if not remove:
+            if self.guard:
+                merge_hooks(hooks, "BeforeTool", "run_shell_command", self.gg("gemini"), {"timeout": 60000})
+                merge_hooks(hooks, "AfterTool", "run_shell_command", self.gp("gemini"), {"timeout": 60000})
+            if self.context or self.role != "none":
+                merge_hooks(hooks, "SessionStart", None, self.gc("gemini", "session", "--with-role"),
+                            {"timeout": 60000})
+            if self.context:
+                merge_hooks(hooks, "BeforeAgent", None, self.gc("gemini", "prompt"), {"timeout": 60000})
+        if not hooks:
+            data.pop("hooks", None)
+        if data or path.exists():
+            ctx.write(path, dump_json(data))
+
+    # GitHub Copilot (CLI and VS Code read ~/.copilot/hooks) --------------------------------
+    def copilot(self, remove: bool = False) -> None:
+        ctx, base = self.ctx, self.ctx.home / ".copilot"
+        hpath = base / "hooks/work-kit.json"
+        if remove:
+            ctx.remove(hpath)
+        else:
+            hooks: dict = {}
+            if self.context or self.role != "none":
+                hooks["sessionStart"] = [{"type": "command", "bash": self.gc("copilot", "session", "--with-role"),
+                                          "timeoutSec": 60}]
+            if self.guard:
+                hooks["preToolUse"] = [{"type": "command", "bash": self.gg("copilot"), "timeoutSec": 60}]
+                hooks["postToolUse"] = [{"type": "command", "bash": self.gp("copilot"), "timeoutSec": 60}]
+            ctx.write(hpath, dump_json({"version": 1, "hooks": hooks}))
+        for r in ("lead", "worker"):
+            f = base / ("agents/kit-%s.agent.md" % r)
+            if remove or self.role == "none":
+                ctx.remove(f)
+            else:
+                ctx.write(f, "---\nname: kit-%s\ndescription: work-kit %s role (%s)\n---\n\n%s"
+                          % (r, r, MANAGED, self.text(r)))
+
+    # Cursor --------------------------------------------------------------------------------
+    def cursor(self, remove: bool = False) -> None:
+        ctx, path = self.ctx, self.ctx.home / ".cursor/hooks.json"
+        data = load_json(path)
+        hooks = data.setdefault("hooks", {})
+        strip_hooks(hooks)
+        if not remove:
+            data.setdefault("version", 1)
+            if self.context or self.role != "none":
+                hooks.setdefault("sessionStart", []).append({"command": self.gc("cursor", "session", "--with-role")})
+            if self.guard:
+                hooks.setdefault("beforeShellExecution", []).append({"command": self.gg("cursor")})
+        if not hooks:
+            data.pop("hooks", None)
+            if list(data) == ["version"]:
+                data = {}
+        if data:
+            ctx.write(path, dump_json(data))
+        elif path.is_file():
+            ctx.remove(path, "only kit hooks were in it")
+        paste = ctx.data / "generated/kit-role-cursor-user-rule.md"
+        if remove or self.role == "none":
+            ctx.remove(paste)
+        else:
+            ctx.write(paste, self.text(),
+                      "paste into Cursor Settings > Rules > User Rules (no file location exists)")
+
+    # opencode ------------------------------------------------------------------------------
+    def opencode(self, remove: bool = False) -> None:
+        ctx, base = self.ctx, self.ctx.xdg / "opencode"
+        plugin = base / "plugins/work-kit.js"
+        if remove or not self.guard:
+            ctx.remove(plugin)
+        else:
+            src = (HERE / "adapters/opencode/work-kit.js").read_text(encoding="utf-8")
+            ctx.write(plugin, src.replace("__KIT_GUARD__", json.dumps(ctx.tool("kit-guard"))))
+        cpath = base / "opencode.json"
+        data = load_json(cpath)
+        instr = [i for i in data.get("instructions", []) if MARK not in str(i)]
+        if not remove and self.role != "none":
+            instr.append(str(self.role_file()))
+        if instr:
+            data["instructions"] = instr
+        else:
+            data.pop("instructions", None)
+        if data or cpath.exists():
+            if not cpath.exists():
+                data = {"$schema": "https://opencode.ai/config.json", **data}
+            ctx.write(cpath, dump_json(data))
+
+    # pi ------------------------------------------------------------------------------------
+    def pi(self, remove: bool = False) -> None:
+        ctx = self.ctx
+        ext = ctx.home / ".pi/agent/extensions/work-kit"
+        if remove:
+            ctx.remove(ext / "index.ts")
+            ctx.remove(ext / "config.json")
+            if ext.is_dir() and not ctx.dry_run and not any(ext.iterdir()):
+                ext.rmdir()
+            return
+        caveman = ctx.data / "caveman/rules/caveman-rule.md"
+        cfg = {
+            "guard": ctx.tool("kit-guard") if self.guard else "",
+            "context": ctx.tool("kit-context") if self.context else "",
+            "rolesDir": str(self.roles_dir),
+            "role": self.role,
+            "caveman": str(caveman),
+        }
+        ctx.write(ext / "index.ts", (HERE / "adapters/pi/index.ts").read_text(encoding="utf-8"))
+        ctx.write(ext / "config.json", dump_json(cfg))
+
+    # Aider ---------------------------------------------------------------------------------
+    def aider(self, remove: bool = False) -> None:
+        ctx, path = self.ctx, self.ctx.home / ".aider.conf.yml"
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        mark = "# work-kit-profiles role"
+        if remove or self.role == "none":
+            new = read_list_drop(text, mark)
+        else:
+            new = read_list_put(text, str(self.role_file()), mark)
+            if new is None:
+                ctx.say("note", path, "read: is an inline list; add %s by hand" % self.role_file())
+                new = text
+        if new.strip() != text.strip():
+            if not new.strip():
+                ctx.remove(path)
+            else:
+                ctx.write(path, new)
+
+    # Continue ------------------------------------------------------------------------------
+    def continue_(self, remove: bool = False) -> None:
+        ctx, f = self.ctx, self.ctx.home / ".continue/rules/kit-role.md"
+        if remove or self.role == "none":
+            ctx.remove(f)
+        else:
+            ctx.write(f, "---\nname: work-kit %s role\nalwaysApply: true\n---\n\n<!-- %s -->\n%s"
+                      % (self.role, MANAGED, self.text()))
+
+    def run(self, harness: str, remove: bool = False) -> None:
+        getattr(self, "continue_" if harness == "continue" else harness)(remove)
+
+
+# --- install / uninstall --------------------------------------------------------------------
+
+def state_path(ctx: Ctx) -> Path:
+    return ctx.dest / "state.json"
+
+
+def write_profiles_conf(ctx: Ctx, role: str, harnesses: list[str], remove: bool = False) -> None:
+    path = ctx.conf_dir / "profiles.conf"
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    keep = [ln for ln in text.splitlines() if not re.match(r"^\s*role(\.[a-z]+)?\s*=", ln)]
+    if not remove:
+        if not text:
+            keep = ["# work-kit harness profiles (32-harness-profiles). KIT_AGENT_ROLE overrides role.",
+                    "# recall=on|off (brain search on each prompt), recall.k=5, kern=on|off"]
+        keep.append("role=%s" % role)
+    new = "\n".join(keep).strip() + "\n"
+    if remove and not [ln for ln in keep if ln.strip() and not ln.startswith("#")]:
+        ctx.remove(path)
+    elif new != text:
+        ctx.write(path, new)
+
+
+def cmd_install(a) -> int:
+    ctx = Ctx(a.dry_run)
+    orch = detect_orchestration(ctx) if a.orchestration == "auto" else a.orchestration
+    names = list(HARNESSES) if a.all else ([h.strip() for h in a.harness.split(",") if h.strip()] if a.harness
+                                          else detected(ctx))
+    bad = [n for n in names if n not in HARNESSES]
+    if bad:
+        print("[profiles] ERROR: unknown harness %s (known: %s)" % (",".join(bad), ",".join(HARNESSES)),
+              file=sys.stderr)
+        return 2
+    print("[profiles] role=%s orchestration=%s harnesses=%s" % (a.role, orch, ",".join(names) or "none detected"))
+    setup = Setup(ctx, a.role, orch, not a.no_guard, not a.no_context, not a.no_statusline)
+    for r in ("lead", "worker"):  # own files of the installed copy: no backup needed
+        f = setup.role_file(r)
+        if not (f.is_file() and f.read_text(encoding="utf-8") == render_role(r, orch)):
+            ctx.say("update" if f.exists() else "create", f)
+            if not ctx.dry_run:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(render_role(r, orch), encoding="utf-8")
+    write_profiles_conf(ctx, a.role, names)
+    for n in names:
+        print("[profiles] --- %s" % n)
+        setup.run(n)
+    st = {"role": a.role, "orchestration": orch, "harnesses": sorted(set(names) | set(_old_state(ctx).get(
+        "harnesses", []))), "guard": not a.no_guard, "context": not a.no_context}
+    if not a.dry_run:
+        ctx.dest.mkdir(parents=True, exist_ok=True)
+        state_path(ctx).write_text(dump_json(st), encoding="utf-8")
+    print("[profiles] done. Restart the harnesses. Worker sessions: KIT_AGENT_ROLE=worker <harness> ...")
+    return 0
+
+
+def _old_state(ctx: Ctx) -> dict:
+    try:
+        return json.loads(state_path(ctx).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_uninstall(a) -> int:
+    ctx = Ctx(a.dry_run)
+    setup = Setup(ctx, "none", "none", False, False, False)
+    for n in HARNESSES:  # every harness: removal only touches kit entries, so this is safe
+        setup.run(n, remove=True)
+    write_profiles_conf(ctx, "none", [], remove=True)
+    return 0
+
+
+def cmd_status(_a) -> int:
+    ctx = Ctx(False)
+    st = _old_state(ctx)
+    print("installed: %s" % ("yes" if st else "no"))
+    for k in ("role", "orchestration", "harnesses", "guard", "context"):
+        if k in st:
+            print("%s: %s" % (k, st[k]))
+    print("detected harnesses: %s" % (",".join(detected(ctx)) or "none"))
+    print("orchestration now: %s" % detect_orchestration(ctx))
+    return 0
+
+
+def cmd_role(a) -> int:
+    ctx = Ctx(True)
+    orch = detect_orchestration(ctx) if a.orchestration == "auto" else a.orchestration
+    sys.stdout.write(render_role(a.which, orch))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="kit-profiles", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("install")
+    i.add_argument("--dry-run", "-n", action="store_true")
+    i.add_argument("--all", action="store_true")
+    i.add_argument("--harness", default="")
+    i.add_argument("--role", choices=("lead", "worker", "none"), default="lead")
+    i.add_argument("--orchestration", choices=("auto", "workbench", "delegate", "none"), default="auto")
+    i.add_argument("--no-guard", action="store_true")
+    i.add_argument("--no-context", action="store_true")
+    i.add_argument("--no-statusline", action="store_true")
+    u = sub.add_parser("uninstall")
+    u.add_argument("--dry-run", "-n", action="store_true")
+    sub.add_parser("status")
+    r = sub.add_parser("role")
+    r.add_argument("which", nargs="?", choices=("lead", "worker"), default="lead")
+    r.add_argument("--orchestration", choices=("auto", "workbench", "delegate", "none"), default="auto")
+    a = p.parse_args(argv)
+    return {"install": cmd_install, "uninstall": cmd_uninstall, "status": cmd_status, "role": cmd_role}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

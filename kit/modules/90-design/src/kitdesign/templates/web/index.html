@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request tracker (prototype)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="brand">Request tracker</div>
+  <span class="badge" title="Everything here is synthetic">Prototype &middot; fake data</span>
+</header>
+<main id="main" class="layout">
+  <section class="list" aria-labelledby="list-title">
+    <div class="list-head">
+      <h1 id="list-title">Open requests</h1>
+      <p class="sub" id="count" aria-live="polite"></p>
+    </div>
+    <div class="filters" role="search">
+      <label class="field">
+        <span>Search</span>
+        <input id="q" type="search" placeholder="Title, team or ID" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Status</span>
+        <select id="status">
+          <option value="">All</option>
+          <option>New</option>
+          <option>In progress</option>
+          <option>Waiting</option>
+          <option>Done</option>
+        </select>
+      </label>
+    </div>
+    <div id="state" class="state" hidden></div>
+    <table id="table" class="table">
+      <thead><tr><th scope="col">ID</th><th scope="col">Title</th><th scope="col">Team</th><th scope="col">Status</th><th scope="col" class="num">Age (days)</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+  <aside class="detail" id="detail" aria-live="polite">
+    <p class="muted">Select a request to see its details.</p>
+  </aside>
+</main>
+<footer class="foot">States for review: <a href="?state=loading">loading</a> &middot; <a href="?state=empty">empty</a> &middot; <a href="?state=error">error</a> &middot; <a href="?">normal</a></footer>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

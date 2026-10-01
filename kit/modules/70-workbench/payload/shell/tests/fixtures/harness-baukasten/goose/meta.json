@@ -1,0 +1,8 @@
+{
+  "harness": "goose",
+  "modell": "goose-qwen3-1-7b",
+  "version": " 1.45.0",
+  "datum": "2026-08-08",
+  "startzeile": "cd <probe>/work && exec goose session",
+  "tippmarke": "probeauftrag-xyzzy"
+}

@@ -1,0 +1,15 @@
+# Run `just` to list tasks.
+default:
+    @just --list
+
+# TODO: replace with the project's real test command
+test:
+    @echo "TODO: add tests"
+
+# Scan the working tree for secrets and deny-list matches
+guard:
+    data-guard scan .
+
+# Regenerate agent instruction files from AGENTS.md
+agents:
+    kit-sync --project .

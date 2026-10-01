@@ -1,0 +1,4 @@
+│ --continue        -C                                       Continue the      │
+│ --thinking               --no-thinking                     Enable thinking   │
+│ --yolo,--yes,--…  -y                                       Automatically     │
+│ --afk                                                      Run in afk        │

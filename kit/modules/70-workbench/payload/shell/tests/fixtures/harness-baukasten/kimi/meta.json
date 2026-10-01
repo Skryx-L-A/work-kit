@@ -1,0 +1,8 @@
+{
+  "harness": "kimi",
+  "modell": "kimi-qwen3-1-7b",
+  "version": "kimi, version 1.49.0",
+  "datum": "2026-08-08",
+  "startzeile": "cd <probe>/work && exec kimi -m ollama-qwen3-1-7b --yolo --afk",
+  "tippmarke": "probeauftrag-xyzzy"
+}

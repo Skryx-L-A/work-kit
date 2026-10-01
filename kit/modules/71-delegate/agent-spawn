@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# agent-spawn: start a named AI worker (any CLI harness) in a tmux pane, hand it a task file,
+# and collect its result file. It only starts, lists, reads and stops workers.
+# Runs on bash 3.2+ (Ubuntu ships 5.x). Needs tmux; git only for --worktree.
+set -euo pipefail
+
+STATE_ROOT="${AGENT_SPAWN_HOME:-${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/agents}"
+CONF="${AGENT_SPAWN_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/work-kit/harnesses.conf}"
+DEFAULT_SESSION="${AGENT_SPAWN_SESSION:-agents}"
+POLL="${AGENT_SPAWN_POLL:-2}"
+# AGENT_SPAWN_TMUX lets tests (or a non-default socket) change the tmux command, e.g. "tmux -L x".
+read -r -a TMUX_CMD <<<"${AGENT_SPAWN_TMUX:-tmux}"
+
+die() { printf 'agent-spawn: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'agent-spawn: %s\n' "$*" >&2; }
+tm() { "${TMUX_CMD[@]}" "$@"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-spawn start <name> --harness H --task FILE [options]
+  agent-spawn list
+  agent-spawn result <name> [--wait SECONDS]
+  agent-spawn peek <name> [LINES]
+  agent-spawn stop <name>... [--remove-worktree]
+  agent-spawn harnesses
+  agent-spawn template            print a task file skeleton
+
+start options:
+  --harness H       claude, codex, gemini, opencode, aider, copilot, or one from harnesses.conf
+  --task FILE       task file (copied into the worker's state directory)
+  --dir DIR         working directory (default: current); with --worktree: the git repository
+  --worktree        run in a new git worktree, branch agent/<name>, next to the repository
+  --base REF        start point of that branch (default: HEAD)
+  --result FILE     where the worker writes its result (default: <state>/<name>/result.md)
+  --model M         passed to harnesses whose command uses $AGENT_MODEL
+  --session S       put the worker in its own window of tmux session S (created if missing);
+                    default: split the current tmux window, or session "agents" outside tmux
+  --close           close the pane when the harness exits (default: keep it, press Enter)
+  --force           replace a finished, stopped or lost worker of the same name
+
+A result is complete when its last non-empty line is exactly DONE.
+result exit codes: 0 complete, 3 still waiting (deadline), 4 worker ended without result,
+5 worker ended, result has no DONE line.
+State: $AGENT_SPAWN_HOME (default ~/.local/share/work-kit/agents). Harness table:
+~/.config/work-kit/harnesses.conf, lines "name = command"; the command is shell text that
+can use "$AGENT_PROMPT", "$AGENT_PROMPT_FILE", "$AGENT_TASK_FILE", "$AGENT_RESULT_FILE",
+"$AGENT_MODEL".
+EOF
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# --- harness table ----------------------------------------------------------------------
+
+builtin_harness() {
+  # The commands are shell text that the pane's launcher expands later, so no expansion here.
+  # shellcheck disable=SC2016
+  case "$1" in
+    claude)   echo 'claude ${AGENT_MODEL:+--model "$AGENT_MODEL"} "$AGENT_PROMPT"' ;;
+    codex)    echo 'codex $(codex_profile) ${AGENT_MODEL:+-m "$AGENT_MODEL"} "$AGENT_PROMPT"' ;;
+    gemini)   echo 'gemini ${AGENT_MODEL:+-m "$AGENT_MODEL"} -i "$AGENT_PROMPT"' ;;
+    opencode) echo 'opencode ${AGENT_MODEL:+-m "$AGENT_MODEL"} --prompt "$AGENT_PROMPT"' ;;
+    aider)    echo 'aider ${AGENT_MODEL:+--model "$AGENT_MODEL"} --message "$AGENT_PROMPT"' ;;
+    copilot)  echo 'copilot ${AGENT_MODEL:+--model "$AGENT_MODEL"} -i "$AGENT_PROMPT"' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints "<source> <command>"; the config file wins over the built-in table, last line wins.
+harness_lookup() {
+  local want="$1" line key val found=""
+  if [ -f "$CONF" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="$(trim "$line")"
+      case "$line" in '' | '#'*) continue ;; esac
+      case "$line" in *=*) ;; *) continue ;; esac
+      key="$(trim "${line%%=*}")"
+      [ "$key" = "$want" ] || continue
+      val="$(trim "${line#*=}")"
+      [ -n "$val" ] && found="$val"
+    done <"$CONF"
+  fi
+  if [ -n "$found" ]; then
+    printf 'conf %s\n' "$found"
+  elif val="$(builtin_harness "$want")"; then
+    printf 'builtin %s\n' "$val"
+  else
+    return 1
+  fi
+}
+
+harness_binary_ok() {
+  local first
+  first="${1%% *}"
+  case "$first" in *'$'* | *'`'* | '') return 0 ;; esac
+  command -v "$first" >/dev/null 2>&1
+}
+
+cmd_harnesses() {
+  local names="claude codex gemini opencode aider copilot" n line key res mark
+  if [ -f "$CONF" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="$(trim "$line")"
+      case "$line" in '' | '#'*) continue ;; esac
+      case "$line" in *=*) ;; *) continue ;; esac
+      key="$(trim "${line%%=*}")"
+      case " $names " in *" $key "*) ;; *) names="$names $key" ;; esac
+    done <"$CONF"
+  fi
+  for n in $names; do
+    res="$(harness_lookup "$n")" || continue
+    mark="ok"
+    harness_binary_ok "${res#* }" || mark="not on PATH"
+    printf '%-10s %-8s %-12s %s\n' "$n" "${res%% *}" "($mark)" "${res#* }"
+  done
+}
+
+# --- state ------------------------------------------------------------------------------
+
+state_dir() { printf '%s/%s\n' "$STATE_ROOT" "$1"; }
+
+valid_name() {
+  case "$1" in
+    '' | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+# Loads $STATE_ROOT/<name>/meta into m_* variables.
+load_meta() {
+  local sd
+  valid_name "$1" || die "invalid worker name: $1"
+  sd="$(state_dir "$1")"
+  [ -f "$sd/meta" ] || die "no such worker: $1 (see: agent-spawn list)"
+  m_name="" m_harness="" m_dir="" m_repo="" m_worktree="" m_pane="" m_task="" m_result=""
+  m_started="" m_session=""
+  # shellcheck disable=SC1091
+  . "$sd/meta"
+}
+
+pane_alive() {
+  local tag
+  [ -n "${1:-}" ] || return 1
+  tag="$(tm display-message -p -t "$1" '#{@agent_name}' 2>/dev/null)" || return 1
+  [ "$tag" = "$2" ]
+}
+
+# True when the last non-empty line of the file is exactly DONE.
+result_complete() {
+  [ -s "$1" ] || return 1
+  awk 'NF { l = $0; sub(/[ \t\r]+$/, "", l); last = l } END { exit (last == "DONE") ? 0 : 1 }' "$1"
+}
+
+# Prints one of: running, result-ready, done, exited:<code>, stopped, lost.
+worker_status() {
+  local name="$1" sd code
+  sd="$(state_dir "$name")"
+  if [ -f "$sd/exit" ]; then
+    code="$(tr -d '[:space:]' <"$sd/exit")"
+    if result_complete "$m_result"; then echo "done"; else echo "exited:$code"; fi
+  elif [ -f "$sd/stopped" ]; then
+    echo "stopped"
+  elif pane_alive "$m_pane" "$name"; then
+    if result_complete "$m_result"; then echo "result-ready"; else echo "running"; fi
+  else
+    echo "lost"
+  fi
+}
+
+# --- start ------------------------------------------------------------------------------
+
+abs_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+write_launcher() {
+  local sd="$1" cmd="$2" close="$3"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# Generated by agent-spawn. Runs the harness inside the tmux pane.'
+    printf 'export AGENT_NAME=%q\n' "$m_name"
+    printf 'export AGENT_TASK_FILE=%q\n' "$sd/task.md"
+    printf 'export AGENT_RESULT_FILE=%q\n' "$m_result"
+    printf 'export AGENT_PROMPT_FILE=%q\n' "$sd/prompt.md"
+    printf 'export AGENT_PROMPT=%q\n' "$(cat "$sd/prompt.md")"
+    printf 'export AGENT_MODEL=%q\n' "$model"
+    # 32-harness-profiles: sessions started here run with the worker role prompt.
+    echo 'export KIT_AGENT_ROLE=worker'
+    # shellcheck disable=SC2016 # expanded in the pane
+    echo 'codex_profile() { grep -q "^\[profiles\.kit-worker\]" "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null && printf -- "--profile kit-worker"; }'
+    printf 'cd %q || exit 1\n' "$m_dir"
+    echo "$cmd"
+    echo 'code=$?'
+    # shellcheck disable=SC2016
+    printf 'echo "$code" >%q && mv %q %q\n' "$sd/exit.tmp" "$sd/exit.tmp" "$sd/exit"
+    if [ "$close" != 1 ]; then
+      # shellcheck disable=SC2016
+      printf '%s\n' 'printf "\n[agent-spawn] harness exited with %s. Press Enter to close this pane.\n" "$code"'
+      echo 'read -r _ || true'
+    fi
+  } >"$sd/run.sh"
+  chmod +x "$sd/run.sh"
+}
+
+write_meta() {
+  local sd="$1"
+  {
+    printf 'm_name=%q\n' "$m_name"
+    printf 'm_harness=%q\n' "$m_harness"
+    printf 'm_dir=%q\n' "$m_dir"
+    printf 'm_repo=%q\n' "$m_repo"
+    printf 'm_worktree=%q\n' "$m_worktree"
+    printf 'm_pane=%q\n' "$m_pane"
+    printf 'm_task=%q\n' "$m_task"
+    printf 'm_result=%q\n' "$m_result"
+    printf 'm_started=%q\n' "$m_started"
+    printf 'm_session=%q\n' "$m_session"
+  } >"$sd/meta.tmp"
+  mv "$sd/meta.tmp" "$sd/meta"
+}
+
+cmd_start() {
+  local name="" harness="" task="" dir="" use_wt=0 base="HEAD" result="" model="" session=""
+  local close=0 force=0 sd top res cmd tmux_pane created_wt=0 target_pane
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --harness | --task | --dir | --base | --result | --model | --session)
+        [ "$#" -ge 2 ] || die "$1 needs a value"
+        case "$1" in
+          --harness) harness="$2" ;;
+          --task) task="$2" ;;
+          --dir) dir="$2" ;;
+          --base) base="$2" ;;
+          --result) result="$2" ;;
+          --model) model="$2" ;;
+          --session) session="$2" ;;
+        esac
+        shift 2
+        ;;
+      --worktree) use_wt=1; shift ;;
+      --close) close=1; shift ;;
+      --force) force=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        [ -z "$name" ] || die "unexpected argument: $1"
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  [ -n "$name" ] || die "start needs a worker name"
+  valid_name "$name" || die "invalid worker name '$name' (use letters, digits, . _ -)"
+  [ -n "$harness" ] || die "start needs --harness (see: agent-spawn harnesses)"
+  [ -n "$task" ] || die "start needs --task FILE (see: agent-spawn template)"
+  [ -s "$task" ] || die "task file missing or empty: $task"
+  command -v tmux >/dev/null 2>&1 || [ "${TMUX_CMD[0]}" != tmux ] || die "tmux not found; install it with: bash <kit>/modules/01-prereqs/install.sh tmux"
+  res="$(harness_lookup "$harness")" || die "unknown harness '$harness' (see: agent-spawn harnesses)"
+  cmd="${res#* }"
+  harness_binary_ok "$cmd" || die "harness '$harness': '${cmd%% *}' is not on PATH"
+
+  dir="${dir:-$PWD}"
+  [ -d "$dir" ] || die "no such directory: $dir"
+  dir="$(cd "$dir" && pwd)"
+
+  sd="$(state_dir "$name")"
+  if [ -e "$sd" ]; then
+    load_meta "$name"
+    case "$(worker_status "$name")" in
+      running | result-ready) die "worker '$name' is still running (agent-spawn stop $name)" ;;
+    esac
+    [ "$force" = 1 ] || die "worker '$name' exists; use another name or --force"
+    mkdir -p "$STATE_ROOT/.old"
+    mv "$sd" "$STATE_ROOT/.old/$name-$(date +%Y%m%d%H%M%S)"
+    warn "previous state of '$name' moved to $STATE_ROOT/.old/"
+  fi
+
+  m_name="$name" m_harness="$harness" m_repo="" m_worktree="" m_pane="" m_session=""
+  m_started="$(date +%Y-%m-%dT%H:%M:%S)"
+  if [ "$use_wt" = 1 ]; then
+    command -v git >/dev/null 2>&1 || die "git not found (needed for --worktree); install it with: bash <kit>/modules/01-prereqs/install.sh git"
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository: $dir"
+    m_repo="$top"
+    m_worktree="$(dirname "$top")/$(basename "$top").worktrees/$name"
+    [ ! -e "$m_worktree" ] || die "worktree path exists: $m_worktree"
+    git -C "$top" worktree add -q -b "agent/$name" "$m_worktree" "$base" \
+      || die "git worktree add failed (branch agent/$name may already exist)"
+    created_wt=1
+    m_dir="$m_worktree"
+  else
+    m_dir="$dir"
+  fi
+
+  mkdir -p "$sd"
+  cp "$task" "$sd/task.md"
+  m_task="$sd/task.md"
+  m_result="$(abs_path "${result:-$sd/result.md}")"
+  mkdir -p "$(dirname "$m_result")"
+  [ ! -e "$m_result" ] || warn "result file already exists and will be overwritten by the worker: $m_result"
+  cat >"$sd/prompt.md" <<EOF
+You are worker "$name". Read the task file $sd/task.md and carry it out.
+Working directory: $m_dir
+Work only inside the paths the task lists as exclusive; report problems outside them instead of fixing them.
+When the work is finished, write your complete result (what you did, how you verified it, open points) as Markdown to $m_result
+The last non-empty line of that file must be exactly: DONE
+Write that file only when you are finished, then stop.
+EOF
+  write_launcher "$sd" "$cmd" "$close"
+
+  # Start the pane. Inside tmux: split the current window. Otherwise (or with --session):
+  # one window per worker in a detached session.
+  local run
+  run="bash $(printf %q "$sd/run.sh")"
+  tmux_pane=""
+  if [ -z "$session" ] && [ -n "${TMUX:-}" ]; then
+    target_pane="${TMUX_PANE:-}"
+    if [ -n "$target_pane" ]; then
+      tmux_pane="$(tm split-window -d -P -F '#{pane_id}' -t "$target_pane" "$run" 2>/dev/null)" || tmux_pane=""
+      [ -z "$tmux_pane" ] || tm select-layout -t "$target_pane" tiled >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -z "$tmux_pane" ]; then
+    session="${session:-$DEFAULT_SESSION}"
+    if tm has-session -t "=$session" 2>/dev/null; then
+      tmux_pane="$(tm new-window -d -t "=$session:" -n "$name" -P -F '#{pane_id}' "$run")" || tmux_pane=""
+    else
+      tmux_pane="$(tm new-session -d -s "$session" -n "$name" -P -F '#{pane_id}' "$run")" || tmux_pane=""
+    fi
+    m_session="$session"
+  fi
+  if [ -z "$tmux_pane" ]; then
+    rm -rf "$sd"
+    [ "$created_wt" = 1 ] && git -C "$m_repo" worktree remove --force "$m_worktree" 2>/dev/null \
+      && git -C "$m_repo" branch -q -D "agent/$name" 2>/dev/null || true
+    die "could not start a tmux pane"
+  fi
+  m_pane="$tmux_pane"
+  tm set-option -p -t "$m_pane" '@agent_name' "$name" >/dev/null 2>&1 || true
+  tm select-pane -t "$m_pane" -T "$name" >/dev/null 2>&1 || true
+  write_meta "$sd"
+
+  printf 'started %s (%s) pane %s\n' "$name" "$harness" "$m_pane"
+  printf '  dir     %s\n  task    %s\n  result  %s\n' "$m_dir" "$m_task" "$m_result"
+  if [ -n "$m_session" ]; then
+    printf '  watch   tmux attach -t %s\n' "$m_session"
+  fi
+  printf '  wait    agent-spawn result %s --wait 1800\n' "$name"
+}
+
+# --- list / result / peek / stop --------------------------------------------------------
+
+each_worker() {
+  local d n
+  [ -d "$STATE_ROOT" ] || return 0
+  for d in "$STATE_ROOT"/*/; do
+    [ -f "${d}meta" ] || continue
+    n="$(basename "$d")"
+    printf '%s\n' "$n"
+  done
+}
+
+cmd_list() {
+  local n st found=0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ "$found" = 0 ]; then
+      printf '%-16s %-14s %-9s %-6s %s\n' NAME STATUS HARNESS PANE RESULT
+      found=1
+    fi
+    load_meta "$n"
+    st="$(worker_status "$n")"
+    printf '%-16s %-14s %-9s %-6s %s\n' "$n" "$st" "$m_harness" "$m_pane" "$m_result"
+  done < <(each_worker)
+  [ "$found" = 1 ] || echo "no workers"
+}
+
+cmd_result() {
+  local name="" wait=0 deadline st
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wait)
+        [ "$#" -ge 2 ] || die "--wait needs seconds"
+        wait="$2"
+        shift 2
+        ;;
+      -*) die "unknown option: $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "result needs a worker name"
+  case "$wait" in '' | *[!0-9]*) die "--wait needs whole seconds" ;; esac
+  load_meta "$name"
+  deadline=$((SECONDS + wait))
+  while :; do
+    if result_complete "$m_result"; then
+      cat "$m_result"
+      return 0
+    fi
+    st="$(worker_status "$name")"
+    case "$st" in
+      running) ;;
+      *)
+        if [ -s "$m_result" ]; then
+          cat "$m_result"
+          warn "worker '$name' is $st and the result has no DONE line"
+          return 5
+        fi
+        warn "worker '$name' is $st and wrote no result ($m_result)"
+        return 4
+        ;;
+    esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      warn "no result from '$name' yet (status $st, deadline reached)"
+      return 3
+    fi
+    sleep "$POLL"
+  done
+}
+
+cmd_peek() {
+  local name="${1:-}" lines="${2:-40}"
+  [ -n "$name" ] || die "peek needs a worker name"
+  load_meta "$name"
+  pane_alive "$m_pane" "$name" || die "pane of '$name' is gone"
+  tm capture-pane -p -t "$m_pane" -S "-$lines"
+}
+
+cmd_stop() {
+  local rm_wt=0 names="" n rc=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --remove-worktree) rm_wt=1 ;;
+      -*) die "unknown option: $1" ;;
+      *) names="$names $1" ;;
+    esac
+    shift
+  done
+  [ -n "$names" ] || die "stop needs a worker name"
+  for n in $names; do
+    load_meta "$n"
+    if pane_alive "$m_pane" "$n"; then
+      tm kill-pane -t "$m_pane" 2>/dev/null || true
+      pane_alive "$m_pane" "$n" && { warn "pane $m_pane of '$n' is still alive"; rc=1; }
+    fi
+    [ -f "$(state_dir "$n")/exit" ] || : >"$(state_dir "$n")/stopped"
+    echo "stopped $n"
+    if [ "$rm_wt" = 1 ] && [ -n "$m_worktree" ] && [ -d "$m_worktree" ]; then
+      if git -C "$m_repo" worktree remove "$m_worktree" 2>/dev/null; then
+        echo "removed worktree $m_worktree (branch agent/$n kept)"
+      else
+        warn "worktree $m_worktree has changes; kept (review it, then: git -C $m_repo worktree remove --force $m_worktree)"
+        rc=1
+      fi
+    fi
+  done
+  return "$rc"
+}
+
+cmd_template() {
+  cat <<'EOF'
+# Task: <short name>
+
+## Goal
+<one or two sentences: the outcome, not the steps>
+
+## Context
+<what the worker must know; paths of files to read; decisions already made>
+
+## Exclusive paths
+<the only files/directories the worker may change; everything else is read-only>
+
+## Done criterion
+<checkable: which command passes, which output must be observed>
+
+## Limits
+<what not to touch or run; data it must not read; time or size limits>
+
+## Result
+Write the result file named in the prompt: what you built, how you verified it (commands and
+observed output), open points and decisions. Last line: DONE
+EOF
+}
+
+main() {
+  local sub="${1:-}"
+  [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    start) cmd_start "$@" ;;
+    list | ls) cmd_list ;;
+    result) cmd_result "$@" ;;
+    peek) cmd_peek "$@" ;;
+    stop) cmd_stop "$@" ;;
+    harnesses) cmd_harnesses ;;
+    template) cmd_template ;;
+    -h | --help | help | '') usage ;;
+    *) die "unknown command: $sub (try: agent-spawn --help)" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,32 @@
+[
+  {
+    "pfad": "~/.local/state/goose/logs/llm_request.1.jsonl",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "{\"data\":null,\"usage\":{\"input_tokens\":3569,\"output_tokens\":214,\"total_tokens\":3783,\"cache_read_input_tokens\":null,\"cache_write_input_tokens\":null}}"
+  },
+  {
+    "pfad": "~/.local/state/goose/logs/llm_request.2.jsonl",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "{\"data\":null,\"usage\":{\"input_tokens\":123,\"output_tokens\":923,\"total_tokens\":1046,\"cache_read_input_tokens\":null,\"cache_write_input_tokens\":null}}"
+  },
+  {
+    "pfad": "~/.local/state/goose/logs/llm_request.0.jsonl",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "{\"data\":null,\"usage\":{\"input_tokens\":3624,\"output_tokens\":262,\"total_tokens\":3886,\"cache_read_input_tokens\":null,\"cache_write_input_tokens\":null}}"
+  },
+  {
+    "pfad": "~/.local/state/goose/logs/cli/2026-08-08/20260808_214649.log",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "{\"timestamp\":\"2026-08-08T19:47:05.954840Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"Session completed\",\"monotonic_counter.goose.session_completions\":1,\"session_type\""
+  },
+  {
+    "pfad": "~/.local/share/goose/sessions/sessions.db-wal",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "input_tokens INTEGER,"
+  }
+]

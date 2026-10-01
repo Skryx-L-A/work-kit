@@ -1,0 +1,47 @@
+# work-kit terminal setup. Sourced from ~/.bashrc; replaced on every install.
+# Put your own additions in ~/.config/work-kit/bashrc.local (never overwritten).
+
+# PATH: user-level tools
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+# History
+shopt -s histappend
+HISTCONTROL=ignoreboth
+
+# Aliases
+alias ll='ls -alF'
+alias ..='cd ..'
+alias g='git'
+alias gs='git status -sb'
+alias gd='git diff'
+alias gl='git log --oneline --graph -n 20'
+alias w='cd ~/work'
+
+# Create a directory and enter it
+mkcd() { mkdir -p -- "$1" && cd -- "$1" || return; }
+
+# direnv: load .envrc per directory
+if command -v direnv >/dev/null 2>&1; then
+  eval "$(direnv hook bash)"
+fi
+
+# fzf: Ctrl-R history, Ctrl-T files, Alt-C directories
+if command -v fzf >/dev/null 2>&1; then
+  if command -v fd >/dev/null 2>&1; then
+    export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+    export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+    export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
+  fi
+  eval "$(fzf --bash 2>/dev/null)"
+fi
+
+# just: tab completion
+if command -v just >/dev/null 2>&1; then
+  eval "$(just --completions bash 2>/dev/null)"
+fi
+
+# Your own additions
+[ -f "$HOME/.config/work-kit/bashrc.local" ] && . "$HOME/.config/work-kit/bashrc.local"

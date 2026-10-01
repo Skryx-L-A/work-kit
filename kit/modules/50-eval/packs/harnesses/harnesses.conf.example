@@ -1,0 +1,20 @@
+# CLI harnesses to compare: `id | command`. The command runs through `sh -c` inside a fresh temp
+# git repo (the task's working copy) with stdin closed. Placeholders: {prompt_file} (task prompt,
+# outside the repo), {repo}, {python}, {pack}. Copy to harnesses.conf and keep only the tools IT
+# approved. Flags were checked against the installed CLIs on 2026-09-25 (Gemini CLI from its docs);
+# re-check with `<tool> --help` after upgrades. Each tool uses its own login and model settings.
+# This file is trusted input: only put commands here that you would run yourself.
+
+fake-good|{python} {pack}/fake_harness.py good
+fake-noop|{python} {pack}/fake_harness.py noop
+
+claude|claude -p --permission-mode acceptEdits < {prompt_file}
+codex|codex exec --sandbox workspace-write --skip-git-repo-check - < {prompt_file}
+opencode|opencode run "$(cat {prompt_file})"
+copilot|copilot -p "$(cat {prompt_file})" --allow-all-tools
+aider|aider --yes-always --no-auto-commits --no-show-model-warnings --message-file {prompt_file} $(git ls-files)
+gemini|gemini --approval-mode auto_edit -p "$(cat {prompt_file})"
+
+# Aider against the local kit-llm model: no data leaves the laptop (checked 2026-09-25 with
+# qwen3.5-4b, context 8192: fix-bug passed, doc-readme and rename failed).
+# aider-local|aider --model openai/qwen3.5-4b --openai-api-base http://127.0.0.1:8080/v1 --openai-api-key local --yes-always --no-auto-commits --no-show-model-warnings --no-check-update --no-analytics --no-gitignore --message-file {prompt_file} $(git ls-files)

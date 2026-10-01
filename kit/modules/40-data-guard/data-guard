@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# data-guard: keep secrets and company-specific strings out of commits and prompts.
+#
+#   data-guard check [FILE|-]      scan text (file or stdin): secrets + deny-list
+#   data-guard scan [PATH]         scan a directory tree (default: .)
+#   data-guard staged              scan staged changes (what the pre-commit hook runs)
+#   data-guard install-hook [REPO] add the pre-commit hook to one repository
+#   data-guard remove-hook [REPO]  remove it again (a chained older hook is restored)
+#   data-guard enable-global       opt in: core.hooksPath for all repositories
+#   data-guard disable-global      undo enable-global
+#   data-guard deny add REGEX      append a pattern to the deny-list (must not start with "-")
+#   data-guard deny remove REGEX   remove that exact pattern again
+#   data-guard deny list|path      show the deny-list or its location
+#   data-guard prune               forget registered repositories whose path no longer exists
+#   data-guard status
+#   Every subcommand accepts -h / --help.
+#
+# Exit codes: 0 clean, 1 finding, 2 usage or setup problem.
+# Missing gitleaks fails closed: staged/check/scan stop with exit 2 and a commit is blocked. For one
+# command only: DATA_GUARD_ALLOW_UNSCANNED=1 git commit ...   (the deny-list still applies).
+# DATA_GUARD_STRICT=1 refuses that override too.
+set -u
+
+HOME_DIR="${DATA_GUARD_HOME:-${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/data-guard}"
+CONF_DIR="${DATA_GUARD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/work-kit}"
+DENY_FILE="${DATA_GUARD_DENY_FILE:-$CONF_DIR/deny-patterns.txt}"
+GLOBAL_HOOKS="$CONF_DIR/git-hooks"
+REPO_LIST="$CONF_DIR/hooked-repos.list"
+MARK="work-kit data-guard hook"
+DISPATCH_MARK="work-kit git-hook dispatcher"   # written by kit-sync (30-agent-setup)
+GLOBAL_FLAG="$GLOBAL_HOOKS/.data-guard-global"     # read by the dispatcher
+HOOK_NAMES="applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge pre-push post-rewrite"
+
+# True when FILE carries MARKTEXT in its first 20 lines.
+has_mark() { [ -f "$1" ] && head -n 20 "$1" 2>/dev/null | grep -qF "$2"; }
+
+# A data-guard stub; the kit-sync dispatcher mentions the stub's marker in its code, so exclude it.
+is_stub() { has_mark "$1" "$MARK" && ! has_mark "$1" "$DISPATCH_MARK"; }
+
+# The global hooks dir is owned by kit-sync when its dispatcher sits there; data-guard then only
+# sets a flag file and a repo list that the dispatcher reads.
+dispatcher_present() { has_mark "$GLOBAL_HOOKS/pre-commit" "$DISPATCH_MARK"; }
+
+repo_top() { git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo "$1"; }
+
+list_add() { # list_add REPO
+  mkdir -p "$CONF_DIR"
+  grep -qxF "$1" "$REPO_LIST" 2>/dev/null || echo "$1" >>"$REPO_LIST"
+}
+
+list_remove() { # list_remove REPO
+  local tmp
+  [ -f "$REPO_LIST" ] || return 0
+  tmp="$(mktemp)"
+  grep -vxF "$1" "$REPO_LIST" >"$tmp" || true
+  cat "$tmp" >"$REPO_LIST"
+  rm -f "$tmp"
+}
+
+# Registered repositories (hooked-repos.list), one path per line; blanks skipped.
+list_entries() { [ -f "$REPO_LIST" ] && grep -v '^[[:space:]]*$' "$REPO_LIST" || true; }
+
+log() { printf 'data-guard: %s\n' "$*" >&2; }
+# A warning line in red on a terminal (NO_COLOR off); DATA_GUARD_COLOR=always forces it.
+red() {
+  if { [ -t 1 ] || [ "${DATA_GUARD_COLOR:-}" = always ]; } && [ -z "${NO_COLOR:-}" ]; then
+    printf '\033[31m%s\033[0m\n' "$*"
+  else
+    printf '%s\n' "$*"
+  fi
+}
+die() { log "$*"; exit 2; }
+
+gitleaks_bin() {
+  if command -v gitleaks >/dev/null 2>&1; then command -v gitleaks; return 0; fi
+  [ -x "$HOME/.local/bin/gitleaks" ] && { echo "$HOME/.local/bin/gitleaks"; return 0; }
+  return 1
+}
+
+gitleaks_config() {
+  if [ -f "$PWD/.gitleaks.toml" ]; then echo "$PWD/.gitleaks.toml"; return; fi
+  [ -f "$HOME_DIR/gitleaks.toml" ] && echo "$HOME_DIR/gitleaks.toml"
+}
+
+# gitleaks is missing: 0 = stop (fail closed), 1 = the caller accepted an unscanned run for this one command.
+scanner_missing() {
+  if [ "${DATA_GUARD_ALLOW_UNSCANNED:-0}" = 1 ] && [ "${DATA_GUARD_STRICT:-0}" != 1 ]; then
+    log "WARNING: gitleaks not found, secret scan skipped (DATA_GUARD_ALLOW_UNSCANNED=1); the deny-list still applies"
+    return 1
+  fi
+  log "BLOCKED: gitleaks not found, so nothing can be scanned for secrets (install module 10-base-tools)."
+  log "For this one command only: DATA_GUARD_ALLOW_UNSCANNED=1 git commit ...   (the deny-list still applies)"
+  return 0
+}
+
+# Runs gitleaks with the given subcommand args; 0 clean, 1 finding, 2 tool missing (fail closed).
+run_gitleaks() {
+  local bin cfg
+  if ! bin="$(gitleaks_bin)"; then
+    scanner_missing && return 2
+    return 0
+  fi
+  cfg="$(gitleaks_config)"
+  local args=("$@" --redact --verbose --no-color --no-banner --exit-code 1)
+  [ -n "$cfg" ] && args+=(--config "$cfg")
+  local out rc=0
+  out="$("$bin" "${args[@]}" 2>&1)" || rc=$?
+  [ "$rc" != 0 ] && printf '%s\n' "$out" | sed 's/^/  /' >&2
+  return "$rc"
+}
+
+active_patterns() {
+  [ -f "$DENY_FILE" ] || return 1
+  grep -v -E '^[[:space:]]*(#|$)' "$DENY_FILE" 2>/dev/null
+}
+
+# stdin: "location:line:text" records. Prints "location:line" of every deny-list match.
+deny_filter() {
+  local pats
+  pats="$(mktemp)"
+  if ! active_patterns >"$pats"; then rm -f "$pats"; cat >/dev/null; return 0; fi
+  if [ ! -s "$pats" ]; then rm -f "$pats"; cat >/dev/null; return 0; fi
+  grep -i -E -f "$pats" | grep -v 'data-guard:allow' | cut -d: -f1,2 | sort -u
+  rm -f "$pats"
+}
+
+report_deny() { # stdin: locations
+  local n=0 loc
+  while IFS= read -r loc; do
+    printf '  deny-list match at %s\n' "$loc" >&2
+    n=$((n + 1))
+  done
+  [ "$n" -eq 0 ] && return 0
+  return 1
+}
+
+added_lines() { # staged additions as file:line:text
+  git -c core.quotepath=false diff --cached -U0 --no-color --diff-filter=ACMR | awk '
+    /^\+\+\+ b\// { file = substr($0, 7); next }
+    /^\+\+\+ /    { file = "?"; next }
+    /^@@ /        { match($0, /\+[0-9]+/); ln = substr($0, RSTART + 1, RLENGTH - 1) + 0; next }
+    /^\+/         { printf "%s:%d:%s\n", file, ln, substr($0, 2); ln++ }'
+}
+
+staged_paths() {
+  git -c core.quotepath=false diff --cached --name-only --diff-filter=ACMR | awk '{ printf "%s:0:%s\n", $0, $0 }'
+}
+
+cmd_staged() {
+  local rc=0
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+  run_gitleaks git --staged || rc=$?
+  [ "$rc" = 2 ] && return 2
+  local denied=0
+  { added_lines; staged_paths; } | deny_filter | report_deny || denied=1
+  if [ "$rc" != 0 ] || [ "$denied" != 0 ]; then
+    log "commit blocked. Remove the data, or mark a false positive (gitleaks:allow / data-guard:allow)."
+    log "Do not bypass with --no-verify."
+    return 1
+  fi
+  return 0
+}
+
+cmd_check() {
+  local src="${1:--}" tmp rc=0 denied=0
+  tmp="$(mktemp)"
+  if [ "$src" = "-" ]; then cat >"$tmp"; else cp "$src" "$tmp" 2>/dev/null || die "cannot read $src"; fi
+  local bin cfg
+  if bin="$(gitleaks_bin)"; then
+    cfg="$(gitleaks_config)"
+    local args=(stdin --redact --verbose --no-color --no-banner --exit-code 1)
+    [ -n "$cfg" ] && args+=(--config "$cfg")
+    local out
+    out="$("$bin" "${args[@]}" <"$tmp" 2>&1)" || rc=$?
+    [ "$rc" != 0 ] && printf '%s\n' "$out" | sed 's/^/  /' >&2
+  else
+    scanner_missing && rc=2
+  fi
+  awk -v f="$src" '{ printf "%s:%d:%s\n", f, NR, $0 }' "$tmp" | deny_filter | report_deny || denied=1
+  rm -f "$tmp"
+  [ "$rc" = 2 ] && return 2
+  [ "$rc" != 0 ] || [ "$denied" != 0 ] && return 1
+  return 0
+}
+
+cmd_scan() {
+  local path="${1:-.}" rc=0 denied=0
+  [ -e "$path" ] || die "no such path: $path"
+  run_gitleaks dir "$path" || rc=$?
+  [ "$rc" = 2 ] && return 2
+  if active_patterns >/dev/null 2>&1; then
+    local pats
+    pats="$(mktemp)"
+    active_patterns >"$pats"
+    if [ -s "$pats" ]; then
+      grep -r -n -I -i -E -f "$pats" --exclude-dir=.git "$path" 2>/dev/null \
+        | grep -v 'data-guard:allow' | cut -d: -f1,2 | sort -u | report_deny || denied=1
+    fi
+    rm -f "$pats"
+  fi
+  [ "$rc" != 0 ] || [ "$denied" != 0 ] && return 1
+  return 0
+}
+
+hooks_dir_of() { # repo path -> effective hooks dir
+  (cd "$1" 2>/dev/null && git rev-parse --git-path hooks 2>/dev/null | while IFS= read -r p; do
+    case "$p" in /*) echo "$p" ;; *) echo "$1/$p" ;; esac
+  done)
+}
+
+stub_source() {
+  for c in "$HOME_DIR/hook-stub.sh" "$(dirname "$0")/hook-stub.sh"; do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+cmd_install_hook() {
+  local repo="${1:-.}" hooks stub target
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || die "no such directory"
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die "$repo is not a git repository"
+  hooks="$(hooks_dir_of "$repo")"
+  [ -n "$hooks" ] || die "cannot find the hooks directory"
+  if [ "$hooks" = "$GLOBAL_HOOKS" ]; then
+    if dispatcher_present; then
+      if [ -e "$GLOBAL_FLAG" ]; then
+        echo "already covered by the global hooks ($GLOBAL_HOOKS)"
+      else
+        list_add "$(repo_top "$repo")"
+        echo "repository added to $REPO_LIST; the kit-sync hooks in $GLOBAL_HOOKS run data-guard for it"
+      fi
+      return 0
+    fi
+    echo "already covered by the global hooks ($GLOBAL_HOOKS)"
+    return 0
+  fi
+  stub="$(stub_source)" || die "hook-stub.sh not found (run install.sh of 40-data-guard)"
+  mkdir -p "$hooks"
+  target="$hooks/pre-commit"
+  if is_stub "$target"; then
+    cp "$stub" "$target"; chmod +x "$target"
+    echo "hook refreshed: $target"
+    return 0
+  fi
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    mv "$target" "$target.work-kit-chained"
+    echo "existing pre-commit hook kept and chained: $target.work-kit-chained"
+  fi
+  cp "$stub" "$target"; chmod +x "$target"
+  list_add "$repo"
+  echo "hook installed: $target"
+}
+
+cmd_remove_hook() {
+  local repo="${1:-.}" hooks target
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || die "no such directory"
+  hooks="$(hooks_dir_of "$repo")"
+  target="$hooks/pre-commit"
+  if [ "$hooks" = "$GLOBAL_HOOKS" ] && dispatcher_present; then
+    list_remove "$(repo_top "$repo")"
+    echo "repository removed from $REPO_LIST"
+    [ -e "$GLOBAL_FLAG" ] && echo "note: data-guard is still on for all repositories (data-guard disable-global)"
+    return 0
+  fi
+  list_remove "$repo"
+  if is_stub "$target"; then
+    rm -f "$target"
+    if [ -e "$target.work-kit-chained" ]; then
+      mv "$target.work-kit-chained" "$target"
+      echo "previous hook restored: $target"
+    else
+      echo "hook removed: $target"
+    fi
+  else
+    echo "no data-guard hook in $hooks"
+  fi
+}
+
+cmd_enable_global() {
+  local stub cur name
+  cur="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$cur" ] && [ "$cur" != "$GLOBAL_HOOKS" ]; then
+    die "core.hooksPath is already set to '$cur'. Remove it first or use install-hook per repository."
+  fi
+  if dispatcher_present; then
+    # kit-sync's dispatcher owns these files: leave them, switch data-guard on with a flag.
+    touch "$GLOBAL_FLAG"
+    [ -n "$cur" ] || git config --global core.hooksPath "$GLOBAL_HOOKS"
+    echo "global hooks enabled: data-guard runs in the kit-sync hooks ($GLOBAL_HOOKS, flag .data-guard-global)"
+    return 0
+  fi
+  stub="$(stub_source)" || die "hook-stub.sh not found (run install.sh of 40-data-guard)"
+  mkdir -p "$GLOBAL_HOOKS"
+  for name in $HOOK_NAMES; do
+    has_mark "$GLOBAL_HOOKS/$name" "$DISPATCH_MARK" && continue
+    cp "$stub" "$GLOBAL_HOOKS/$name"
+    chmod +x "$GLOBAL_HOOKS/$name"
+  done
+  git config --global core.hooksPath "$GLOBAL_HOOKS"
+  echo "global hooks enabled: core.hooksPath=$GLOBAL_HOOKS (hooks of each repository still run)"
+}
+
+cmd_disable_global() {
+  local cur
+  cur="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+  if dispatcher_present; then
+    # The dispatcher stays (co-author cleanup, chaining); only data-guard's flag goes.
+    if [ -e "$GLOBAL_FLAG" ]; then
+      rm -f "$GLOBAL_FLAG"
+      echo "global hooks disabled (kit-sync hooks stay; repositories in $REPO_LIST are still guarded)"
+    else
+      echo "global hooks are not enabled"
+    fi
+    return 0
+  fi
+  if [ "$cur" = "$GLOBAL_HOOKS" ]; then
+    git config --global --unset core.hooksPath
+    echo "global hooks disabled"
+  else
+    echo "global hooks are not enabled (core.hooksPath='${cur:-unset}')"
+  fi
+}
+
+cmd_deny() {
+  local pat
+  case "${1:-}" in
+    add)
+      pat="${2:-}"
+      [ -n "$pat" ] || die "usage: data-guard deny add REGEX"
+      case "$pat" in -*) die "refusing a pattern that starts with '-' (looks like an option): $pat" ;; esac
+      [ "$#" -le 2 ] || die "usage: data-guard deny add REGEX (quote the pattern; got extra arguments)"
+      printf '' | grep -E -e "$pat" >/dev/null 2>&1
+      [ "$?" != 2 ] || die "not a valid extended regular expression: $pat"
+      if grep -qxF -e "$pat" "$DENY_FILE" 2>/dev/null; then
+        echo "already in $DENY_FILE"
+        return 0
+      fi
+      mkdir -p "$(dirname "$DENY_FILE")"
+      printf '%s\n' "$pat" >>"$DENY_FILE"
+      echo "added to $DENY_FILE"
+      ;;
+    remove)
+      pat="${2:-}"
+      [ -n "$pat" ] || die "usage: data-guard deny remove REGEX"
+      [ "$#" -le 2 ] || die "usage: data-guard deny remove REGEX (quote the pattern; got extra arguments)"
+      grep -qxF -e "$pat" "$DENY_FILE" 2>/dev/null || die "pattern not in $DENY_FILE: $pat"
+      local tmp
+      tmp="$(mktemp)"
+      grep -vxF -e "$pat" "$DENY_FILE" >"$tmp" || true
+      cat "$tmp" >"$DENY_FILE"
+      rm -f "$tmp"
+      echo "removed from $DENY_FILE"
+      ;;
+    list) active_patterns || echo "(no active patterns in $DENY_FILE)" ;;
+    path) echo "$DENY_FILE" ;;
+    *) die "usage: data-guard deny add REGEX | remove REGEX | list | path" ;;
+  esac
+}
+
+cmd_prune() {
+  local repo n=0 keep
+  keep="$(mktemp)"
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    if [ -d "$repo" ]; then printf '%s\n' "$repo" >>"$keep"; else echo "forgotten (path is gone): $repo"; n=$((n + 1)); fi
+  done <<EOF
+$(list_entries)
+EOF
+  if [ "$n" = 0 ]; then echo "nothing to prune"; else cat "$keep" >"$REPO_LIST"; fi
+  rm -f "$keep"
+}
+
+cmd_status() {
+  local bin n dead=0 repo word
+  if bin="$(gitleaks_bin)"; then echo "gitleaks:    $bin"
+  else red "gitleaks:    NOT FOUND - commits are BLOCKED (fail closed); install 10-base-tools, or once: DATA_GUARD_ALLOW_UNSCANNED=1 git commit ..."; fi
+  echo "config:      $(gitleaks_config || true)"
+  n="$(active_patterns 2>/dev/null | wc -l | tr -d ' ')"
+  word=patterns; [ "$n" = 1 ] && word=pattern
+  echo "deny-list:   $DENY_FILE ($n active $word)"
+  echo "global hook: $(git config --global --get core.hooksPath 2>/dev/null || echo off)"
+  n="$(list_entries | wc -l | tr -d ' ')"
+  if dispatcher_present; then
+    if [ -e "$GLOBAL_FLAG" ]; then echo "dispatcher:  kit-sync hooks, data-guard on for all repositories"
+    else echo "dispatcher:  kit-sync hooks, data-guard only for repositories in $REPO_LIST$([ "$n" = 0 ] && echo " (no repositories registered)")"; fi
+  else
+    echo "dispatcher:  none (30-agent-setup not installed); repositories in $REPO_LIST$([ "$n" = 0 ] && echo " (no repositories registered)")"
+  fi
+  if [ "$n" != 0 ]; then
+    echo "registered:  $n"
+    while IFS= read -r repo; do
+      if [ -d "$repo" ]; then echo "  $repo"; else echo "  $repo  (path no longer exists)"; dead=$((dead + 1)); fi
+    done <<EOF
+$(list_entries)
+EOF
+    [ "$dead" = 0 ] || echo "             run 'data-guard prune' to forget the $dead missing path(s)"
+  fi
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    local h top
+    h="$(hooks_dir_of "$PWD")/pre-commit"
+    top="$(repo_top "$PWD")"
+    if is_stub "$h"; then echo "this repo:   hook installed"
+    elif dispatcher_present && { [ -e "$GLOBAL_FLAG" ] || grep -qxF "$top" "$REPO_LIST" 2>/dev/null; }; then
+      echo "this repo:   guarded by the kit-sync hooks"
+    else echo "this repo:   no data-guard pre-commit hook"; fi
+  fi
+}
+
+# The header comment of this file is the help text.
+usage() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$0"; }
+
+# Help first, options next: nothing below may treat "--help" as a path or a pattern.
+sub="${1:-}"
+for a in "$@"; do
+  case "$a" in -h|--help) usage; exit 0 ;; esac
+done
+case "$sub" in
+  check|scan|staged|install-hook|remove-hook|enable-global|disable-global|prune|status)
+    for a in "${@:2}"; do
+      case "$a" in
+        -) ;;
+        -*) log "unknown option: $a"; usage >&2; exit 2 ;;
+      esac
+    done ;;
+esac
+
+case "$sub" in
+  check) shift; cmd_check "$@" ;;
+  scan) shift; cmd_scan "$@" ;;
+  staged) cmd_staged ;;
+  install-hook) shift; cmd_install_hook "$@" ;;
+  remove-hook) shift; cmd_remove_hook "$@" ;;
+  enable-global) cmd_enable_global ;;
+  disable-global) cmd_disable_global ;;
+  deny) shift; cmd_deny "$@" ;;
+  prune) cmd_prune ;;
+  status) cmd_status ;;
+  help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,22 @@
+# wb-hygiene.timer -- feuert wb-hygiene.service woechentlich, Montag 04:00 Uhr
+# lokale Zeit (Wahl des Nutzers am 22.08.2026, gleiche Begruendung wie bei
+# wb-testsuite.timer: nachts stoert der Lauf niemanden -- vorher Montag 09:00).
+# Einen Tag nach der Testsuite, damit die beiden sich nicht in dieselbe Nacht
+# legen.
+#
+# Auf dem Mac gibt es kein Gegenstueck mehr, siehe wb-testsuite.timer.
+#
+# Persistent=true holt einen verpassten Lauf nach, sobald der Timer als naechstes
+# aktiv wird (Maschine war Montag 9 Uhr aus) -- dieselbe Verbesserung gegenueber
+# der Mac-Seite wie bei wb-testsuite.timer.
+
+[Unit]
+Description=Woechentlicher Timer fuer wb-hygiene.service
+
+[Timer]
+OnCalendar=Mon *-*-* 04:00:00
+Persistent=true
+Unit=wb-hygiene.service
+
+[Install]
+WantedBy=timers.target

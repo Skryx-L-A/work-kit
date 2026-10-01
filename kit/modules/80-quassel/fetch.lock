@@ -1,0 +1,28 @@
+# 80-quassel offline artifacts: sha256  path-under-offline/quassel  source URL
+# Every sha256 was checked against the value its publisher shows (GitHub release digest,
+# Hugging Face LFS oid, Ubuntu Packages index). Change a line only after the same check.
+# Quassel app source, release v2.7.0 (commit 1a36dc6297c26049596548bb10095922a0ce2011)
+0e42fdee9f56dc102e310db8e9d96da0174999c66e86e79ffead4fce94b3e8ff  app/quassel-1a36dc6297c26049596548bb10095922a0ce2011.tar.gz  https://github.com/Skryx-L-A/quassel/archive/1a36dc6297c26049596548bb10095922a0ce2011.tar.gz
+# whisper.cpp 1.8.6 whisper-server, CPU, portable (glibc >= 2.27, AVX2/FMA/F16C), from Quassel release v2.2.0
+01997d327aa11332f0890ea5080062cf9784ba004e566e9f77b1a440755b793c  engine/quassel-engine-linux-cpu-x86_64.tar.gz  https://github.com/Skryx-L-A/quassel/releases/download/v2.2.0/quassel-engine-linux-cpu-x86_64.tar.gz
+# Whisper models (multilingual), huggingface.co/ggerganov/whisper.cpp revision 5359861c
+ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb  models/ggml-small-q5_1.bin  https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin
+19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f  models/ggml-medium-q5_0.bin  https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-medium-q5_0.bin
+# Silero VAD, huggingface.co/ggml-org/whisper-vad revision 9ffd54a1
+29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf  models/ggml-silero-v5.1.2.bin  https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin
+# ydotool 1.0.4 upstream binaries (libc only, glibc >= 2.34). Ubuntu 24.04 ships 0.1.8, which Quassel cannot use.
+daa83507a596d6839b7467540382dbdc6e4bf64ebfa4f7d6416e877d9a522c0c  bin/ydotool  https://github.com/ReimuNotMoe/ydotool/releases/download/v1.0.4/ydotool-release-ubuntu-latest
+3f14f96308935214c0fb154507360f7632e7deda1935dc2d538259fd9986ed36  bin/ydotoold  https://github.com/ReimuNotMoe/ydotool/releases/download/v1.0.4/ydotoold-release-ubuntu-latest
+# Ubuntu 24.04 (noble, release pocket) packages, unpacked under $HOME at install time, never installed with apt
+f9239af0335551759b2c36f442c86902c50335bdd08481fce9f7e8e545832c2e  debs/wl-clipboard_2.2.1-1build1_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/universe/w/wl-clipboard/wl-clipboard_2.2.1-1build1_amd64.deb
+bb98b6b3c9f7338f1e1e7b56aad3c7dfec0f1b6032bda9546061c2469aa93910  debs/xclip_0.13-3_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/universe/x/xclip/xclip_0.13-3_amd64.deb
+cc9f697ffb5f19a57d055b42e9642cc6355d1eed7fbdfd168a441d353e256157  debs/libnotify-bin_0.8.3-1build2_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/libn/libnotify/libnotify-bin_0.8.3-1build2_amd64.deb
+af7af42226d21bcbf87cf62a9e158bd5dfbd051ebbde8818ca441dc8085f67af  debs/curl_8.5.0-2ubuntu10_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10_amd64.deb
+1c597ce8778ced5ff37fcb767968ffc9fb75944d96b9e6c06e63cc611846878e  debs/libcurl4t64_8.5.0-2ubuntu10_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/c/curl/libcurl4t64_8.5.0-2ubuntu10_amd64.deb
+137cf52479b5a9d8c5926d70d311af04be41941a32ee777340d704cc458c06d8  debs/libxcb-cursor0_0.1.4-1build1_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/universe/x/xcb-util-cursor/libxcb-cursor0_0.1.4-1build1_amd64.deb
+6af300eeef5523aa0d8dbfab3a23c1fe7006ecc19f8abdc5c636d734d7bb5287  debs/libxcb-image0_0.4.0-2build1_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/x/xcb-util-image/libxcb-image0_0.4.0-2build1_amd64.deb
+95d895ceb921e38e4edd85555b407b1a0564d8ad097ec7566e261764ce27787b  debs/libxcb-render-util0_0.3.9-1build4_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/x/xcb-util-renderutil/libxcb-render-util0_0.3.9-1build4_amd64.deb
+b6ff05729519514bddcbcd460f8be7e55c986daa5a97ecdc612b2815614194ab  debs/libxcb-util1_0.4.0-1build3_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/main/x/xcb-util/libxcb-util1_0.4.0-1build3_amd64.deb
+# Ubuntu 22.04 (jammy) replacements, unpacked over the noble set on jammy only: noble's
+# libxcb-cursor needs GLIBC_2.38, jammy has 2.35 (hash from the gpgv-checked jammy universe index)
+c9b5d1ad4af57397b1bd77e0a92750e34419def134c0282a0836ae9efc07cf64  debs/jammy/libxcb-cursor0_0.1.1-4ubuntu1_amd64.deb  http://archive.ubuntu.com/ubuntu/pool/universe/x/xcb-util-cursor/libxcb-cursor0_0.1.1-4ubuntu1_amd64.deb

@@ -1,0 +1,51 @@
+# Structured extraction: JSON output checked against a schema and against expected values.
+# `regex-baseline` runs offline. To try a model: `evalkit run examples/extraction.yaml -p llm -p regex-baseline`
+# (default endpoint: local Ollama; override with EVALKIT_BASE_URL / EVALKIT_MODEL).
+name: invoice-extraction
+description: Extract invoice number, date, total and currency from short documents as JSON.
+repetitions: 3
+timeout: 120
+
+prompt: |
+  Extract invoice_number, date (YYYY-MM-DD), total (number) and currency (EUR, USD or GBP)
+  from the document below. Reply with a single JSON object and nothing else.
+
+  Document:
+  {input}
+
+providers:
+  - id: regex-baseline
+    type: shell
+    command: "{python} extract_baseline.py"
+  - id: llm
+    type: openai
+    default: false            # only runs when selected with -p llm
+    base_url: "${EVALKIT_BASE_URL:-http://localhost:11434/v1}"
+    model: "${EVALKIT_MODEL:-llama3.2}"
+    # api_key_env: OPENAI_API_KEY   # name of the env var holding the key, never the key itself
+    temperature: 0
+
+cases:
+  - id: plain
+    input: |
+      Invoice INV-2041, issued 2026-03-14. Amount due: EUR 1,234.50. Payment within 30 days.
+    graders:
+      - {type: json-schema, schema_file: schemas/invoice.schema.json}
+      - type: script
+        command: "{python} check_fields.py '{\"invoice_number\": \"INV-2041\", \"date\": \"2026-03-14\", \"total\": 1234.5, \"currency\": \"EUR\"}'"
+  - id: dollars
+    input: |
+      From: billing@example.com
+      Subject: Your receipt
+      Receipt AB-77 dated 2025-12-01. Total charged USD 89.00 to your card.
+    graders:
+      - {type: json-schema, schema_file: schemas/invoice.schema.json}
+      - type: script
+        command: "{python} check_fields.py '{\"invoice_number\": \"AB-77\", \"total\": 89, \"currency\": \"USD\"}'"
+  - id: german-number-format   # the regex baseline is expected to fail this one
+    input: |
+      Rechnung RE-1093 vom 2026-01-31. Gesamtbetrag: EUR 1.234,50.
+    graders:
+      - {type: json-schema, schema_file: schemas/invoice.schema.json}
+      - type: script
+        command: "{python} check_fields.py '{\"total\": 1234.5}'"

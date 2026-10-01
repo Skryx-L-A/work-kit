@@ -1,0 +1,1002 @@
+# Synthetic work-style notes for the embedding model measurement.
+# All names, customers and systems are invented. Mixed German and English on purpose.
+notes:
+# --- mainframe / COBOL migration
+- id: n001
+  title: COBOL batch jobs inventory
+  body: |
+    ## Findings
+    The customer runs 312 nightly batch jobs written in COBOL on z/OS. About 40 of them are
+    no longer triggered by the scheduler and can be retired. JCL files live in a separate PDS.
+- id: n002
+  title: Copybooks und Datenstrukturen
+  body: |
+    ## Beobachtung
+    Viele Programme teilen sich dieselben Copybooks. Änderungen an einem Copybook betreffen
+    bis zu 60 Programme. Vor jeder Migration eine Abhängigkeitsliste der Copybooks erzeugen.
+- id: n003
+  title: Rehosting versus rewriting the loan system
+  body: |
+    ## Options
+    Rehosting keeps the COBOL code and moves it to a Linux runtime. Rewriting in Java costs
+    three times more but removes the dependency on scarce COBOL developers.
+- id: n004
+  title: EBCDIC-Konvertierung beim Datenexport
+  body: |
+    ## Problem
+    Beim Export der Stammdaten vom Host kamen Umlaute kaputt an. Ursache: Codepage 273 statt
+    1141. Packed-Decimal-Felder dürfen nicht als Text konvertiert werden.
+- id: n005
+  title: Mainframe test data extraction
+  body: |
+    ## Steps
+    Test data is pulled from the production host with a masking job. Account numbers and names
+    are replaced before the file leaves the host. The masking rules are owned by the data office.
+- id: n006
+  title: CICS Transaktionen dokumentieren
+  body: |
+    ## Stand
+    Für 85 CICS-Transaktionen gibt es keine Dokumentation. Wir leiten Masken und Abläufe aus
+    den BMS-Maps ab und prüfen sie mit den Fachanwendern.
+# --- Java upgrade
+- id: n007
+  title: Java 8 to 21 upgrade plan
+  body: |
+    ## Plan
+    Upgrade in two steps: first Java 11 with javax to jakarta unchanged, then Java 21.
+    Remove the Nashorn scripts before step two because the engine was dropped.
+- id: n008
+  title: Jakarta namespace migration
+  body: |
+    ## Notes
+    Switching javax.* imports to jakarta.* breaks old Hibernate 5 mappings. Use the OpenRewrite
+    recipe and upgrade Hibernate to 6 in the same change.
+- id: n009
+  title: Illegal reflective access Warnungen
+  body: |
+    ## Befund
+    Nach dem Wechsel auf Java 17 scheitern zwei Bibliotheken wegen starker Kapselung der JDK-Interna.
+    Übergangsweise --add-opens setzen, langfristig Bibliothek aktualisieren.
+- id: n010
+  title: Spring Boot 2 auf 3 migrieren
+  body: |
+    ## Erfahrungen
+    Spring Boot 3 verlangt Java 17. Die Security-Konfiguration muss von WebSecurityConfigurerAdapter
+    auf SecurityFilterChain-Beans umgestellt werden. Actuator-Endpunkte haben neue Pfade.
+- id: n011
+  title: Maven build is slow after upgrade
+  body: |
+    ## Cause
+    The build went from 6 to 14 minutes. The new surefire version forks a JVM per test class.
+    Setting reuseForks=true brought it back to 7 minutes.
+- id: n012
+  title: Virtual threads evaluation
+  body: |
+    ## Result
+    Virtual threads in Java 21 reduced memory for the import service with many blocking calls.
+    Synchronized blocks pin the carrier thread; replace them with ReentrantLock.
+# --- databases
+- id: n013
+  title: Oracle nach PostgreSQL Migration
+  body: |
+    ## Vorgehen
+    Schema mit ora2pg konvertiert. PL/SQL-Pakete müssen von Hand nach PL/pgSQL übertragen werden.
+    Sequenzen und leere Strings (Oracle: NULL) sind die häufigsten Fehlerquellen.
+- id: n014
+  title: Empty string versus NULL
+  body: |
+    ## Pitfall
+    Oracle treats an empty string as NULL, PostgreSQL does not. Queries with "IS NULL" returned
+    fewer rows after migration. Normalise empty strings during the data load.
+- id: n015
+  title: Index für Kundensuche
+  body: |
+    ## Lösung
+    Die Suche nach Kundennamen lief als Full Table Scan. Ein Trigram-Index (pg_trgm) auf der
+    Namensspalte senkte die Antwortzeit von 4 s auf 80 ms.
+- id: n016
+  title: Database backup and restore drill
+  body: |
+    ## Result
+    We restored last night's backup into a scratch instance. Restore took 42 minutes for 180 GB.
+    Point-in-time recovery needs the WAL archive, which was missing for two days.
+- id: n017
+  title: Connection pool exhausted
+  body: |
+    ## Incident
+    The order service ran out of database connections at noon. A report query held connections
+    for minutes. HikariCP maximumPoolSize raised to 30 and the report moved to a replica.
+- id: n018
+  title: Flyway Migrationen Konventionen
+  body: |
+    ## Regeln
+    Jede Schemaänderung als versionierte Flyway-Datei V<Nummer>__beschreibung.sql. Keine
+    Änderungen an bereits ausgerollten Skripten, stattdessen neue Migration anlegen.
+- id: n019
+  title: Deadlocks im Buchungsmodul
+  body: |
+    ## Analyse
+    Zwei Transaktionen sperren Konto und Buchung in unterschiedlicher Reihenfolge. Einheitliche
+    Sperrreihenfolge eingeführt, seitdem keine Deadlocks mehr im Log.
+- id: n020
+  title: Read replica lag
+  body: |
+    ## Observation
+    The reporting replica lags up to 90 seconds during the nightly import. Dashboards that need
+    fresh numbers must read from the primary.
+# --- CI/CD
+- id: n021
+  title: GitLab Pipeline Aufbau
+  body: |
+    ## Stufen
+    build, test, scan, package, deploy. Die Scan-Stufe läuft parallel zu den Integrationstests.
+    Artefakte werden 7 Tage aufbewahrt.
+- id: n022
+  title: Build cache for Gradle in CI
+  body: |
+    ## Setup
+    The Gradle cache is stored per branch with a fallback to main. Cold builds take 11 minutes,
+    warm builds 3 minutes. The cache key includes the wrapper version.
+- id: n023
+  title: Jenkins Ablösung
+  body: |
+    ## Entscheidung offen
+    Die alten Jenkins-Jobs sind nicht versioniert. Vorschlag: schrittweise nach GitLab CI
+    überführen, zuerst die Bibliotheksprojekte, zuletzt die Release-Jobs.
+- id: n024
+  title: Deployment to staging fails on Fridays
+  body: |
+    ## Cause
+    The staging certificate renewal job runs Friday 14:00 and restarts the ingress. Deployments
+    in that window fail. Moved the renewal to Sunday night.
+- id: n025
+  title: Semantic versioning for libraries
+  body: |
+    ## Rule
+    Internal libraries use semantic versioning. Breaking changes need a major version and a
+    migration note in the changelog.
+- id: n026
+  title: Pipeline Secrets Handhabung
+  body: |
+    ## Regeln
+    Zugangsdaten nur als geschützte, maskierte CI-Variablen. Niemals in YAML-Dateien oder im
+    Log ausgeben. Rotation alle 90 Tage.
+- id: n027
+  title: Container image size reduction
+  body: |
+    ## Result
+    Multi-stage build and a distroless base reduced the image from 1.2 GB to 210 MB. Startup
+    time dropped by a third.
+- id: n028
+  title: Release Checkliste
+  body: |
+    ## Punkte
+    Changelog aktualisiert, Datenbankmigration getestet, Rollback-Plan vorhanden, Fachbereich
+    informiert, Monitoring-Dashboards geprüft.
+# --- testing
+- id: n029
+  title: Characterization tests for the tariff engine
+  body: |
+    ## Approach
+    Before touching the tariff calculation we recorded 2,000 real input/output pairs and turned
+    them into golden master tests. Any diff must be explained before merging.
+- id: n030
+  title: Flaky Tests im Checkout
+  body: |
+    ## Ursache
+    Drei Tests hängen von der Systemzeit ab und schlagen um Mitternacht fehl. Uhr über eine
+    injizierbare Clock-Klasse steuerbar gemacht.
+- id: n031
+  title: Mutation testing trial
+  body: |
+    ## Result
+    PIT found that 35 % of mutants in the pricing module survive although line coverage is 90 %.
+    Many assertions only checked that no exception was thrown.
+- id: n032
+  title: Testcontainers statt In-Memory-Datenbank
+  body: |
+    ## Entscheidung
+    H2 verhielt sich anders als PostgreSQL. Integrationstests laufen jetzt mit Testcontainers
+    gegen eine echte PostgreSQL-Instanz.
+- id: n033
+  title: Contract tests between services
+  body: |
+    ## Notes
+    Consumer-driven contracts with Pact catch breaking API changes before deployment.
+    The broker runs on the internal cluster.
+- id: n034
+  title: Testabdeckung Zielwerte
+  body: |
+    ## Vereinbarung
+    Keine starre Prozentvorgabe. Neue Geschäftslogik braucht Tests, Legacy-Code wird beim Anfassen
+    mit Charakterisierungstests abgesichert.
+- id: n035
+  title: Load test of the booking API
+  body: |
+    ## Result
+    With k6 we reached 450 requests per second before latency passed one second. The bottleneck
+    was JSON serialisation of large responses.
+- id: n036
+  title: End-to-End-Tests mit Playwright
+  body: |
+    ## Stand
+    Die alten Selenium-Tests wurden durch Playwright ersetzt. Laufzeit von 40 auf 12 Minuten
+    gesenkt, Screenshots bei Fehlschlag im Artefakt.
+# --- security
+- id: n037
+  title: Dependency vulnerability scan
+  body: |
+    ## Findings
+    The scan reported 14 critical CVEs, 11 of them in transitive dependencies of an old
+    Jackson version. Upgrading Jackson fixed most of them.
+- id: n038
+  title: Geheimnisse im Git-Verlauf
+  body: |
+    ## Vorfall
+    Ein API-Schlüssel wurde versehentlich committet. Schlüssel sofort widerrufen, Verlauf
+    bereinigt, Pre-Commit-Hook mit gitleaks eingeführt.
+- id: n039
+  title: TLS certificate expiry
+  body: |
+    ## Incident
+    The partner interface stopped working because a client certificate expired. We now monitor
+    expiry dates and alert 30 days in advance.
+- id: n040
+  title: Penetrationstest Ergebnisse
+  body: |
+    ## Zusammenfassung
+    Der externe Test fand eine fehlende Rate-Limitierung am Login und zu ausführliche
+    Fehlermeldungen. Beides bis Ende des Monats beheben.
+- id: n041
+  title: Input validation guidelines
+  body: |
+    ## Rules
+    Validate on the server, never trust the client. Use allow-lists for file uploads and
+    parameterised queries everywhere to prevent SQL injection.
+- id: n042
+  title: Zugriffsrechte Überprüfung
+  body: |
+    ## Ablauf
+    Einmal im Quartal prüfen Teamleitungen die Berechtigungen ihrer Mitarbeitenden in Git,
+    Ticketsystem und Cloud-Konten. Ergebnis wird dokumentiert.
+- id: n043
+  title: SBOM generation
+  body: |
+    ## Setup
+    Every release produces a CycloneDX software bill of materials. It is attached to the release
+    and used to answer customer questions about components.
+- id: n044
+  title: Passwort-Hashing Umstellung
+  body: |
+    ## Maßnahme
+    Alte SHA-1-Hashes werden beim nächsten Login auf Argon2id umgestellt. Nach sechs Monaten
+    werden verbleibende Konten zum Zurücksetzen gezwungen.
+# --- AI experiments
+- id: n045
+  title: LLM-assisted code review experiment
+  body: |
+    ## Result
+    The model found 6 of 10 seeded bugs but also produced 14 irrelevant comments. Useful as a
+    first pass, never as the only reviewer.
+- id: n046
+  title: Zusammenfassung von Tickets mit KI
+  body: |
+    ## Versuch
+    Lange Ticketverläufe wurden automatisch zusammengefasst. Fachleute bewerteten 70 % der
+    Zusammenfassungen als brauchbar. Personenbezogene Daten vorher entfernen.
+- id: n047
+  title: Retrieval-augmented generation for internal docs
+  body: |
+    ## Prototype
+    Chunked the architecture wiki by heading, embedded with a small multilingual model and let
+    the assistant answer with citations. Wrong answers came mostly from outdated pages.
+- id: n048
+  title: Welche Daten dürfen in externe KI-Dienste
+  body: |
+    ## Stand
+    Öffentliche Informationen ja, interne Dokumente nur mit freigegebenem Dienst, Kundendaten
+    nie. Bei Unsicherheit vorher Datenschutz fragen.
+- id: n049
+  title: Evaluating prompts with a test set
+  body: |
+    ## Method
+    Each prompt version runs against 50 fixed cases. We track pass rate and cost. A prompt only
+    replaces the old one if it wins on the full set, not on a few examples.
+- id: n050
+  title: Lokale Modelle auf dem Laptop
+  body: |
+    ## Erfahrung
+    Ein 7B-Modell läuft auf CPU mit etwa 8 Tokens pro Sekunde. Für Klassifikation reicht das,
+    für lange Texte ist es zu langsam.
+- id: n051
+  title: COBOL explanation with an assistant
+  body: |
+    ## Result
+    The assistant explained paragraph logic of old COBOL programs well but invented the meaning
+    of cryptic field names. Always confirm with a domain expert.
+- id: n052
+  title: KI-Anwendungsfälle Bewertung
+  body: |
+    ## Kriterien
+    Klare Aufgabe, messbares Ergebnis, prüfbare Ausgabe, keine sensiblen Daten, Aufwand
+    gegenüber Nutzen. Jeder Fall bekommt eine Punktzahl von 1 bis 5.
+- id: n053
+  title: Generating unit tests with AI
+  body: |
+    ## Observation
+    Generated tests compiled in 80 % of cases but often asserted the current (buggy) behaviour.
+    Review each test like hand-written code.
+- id: n054
+  title: Halluzinationen bei Dokumentationsfragen
+  body: |
+    ## Beobachtung
+    Ohne Quellen erfand das Modell Konfigurationsparameter. Mit Zitaten aus der Doku sank die
+    Fehlerquote deutlich. Antworten ohne Beleg nicht übernehmen.
+# --- meetings / sessions
+- id: n055
+  title: Sprint review 42
+  body: |
+    ## Demo
+    Showed the new invoice export. Finance asked for a CSV option with semicolons.
+    ## Open
+    Date format in the export is still American.
+- id: n056
+  title: Retrospektive Team Payment
+  body: |
+    ## Ergebnisse
+    Zu viele parallele Themen. Beschluss: maximal zwei Stories gleichzeitig in Arbeit, tägliches
+    Abstimmen mit dem Product Owner.
+- id: n057
+  title: Customer workshop on migration scope
+  body: |
+    ## Agreement
+    The customer wants the online banking frontend first, the batch processing later. Budget
+    approval comes in November.
+- id: n058
+  title: Kick-off Projekt Lagerverwaltung
+  body: |
+    ## Rahmen
+    Laufzeit neun Monate, Team aus fünf Entwicklern. Altsystem in Delphi, Ziel: Webanwendung
+    mit Java-Backend.
+- id: n059
+  title: Architecture board meeting
+  body: |
+    ## Decisions
+    Event streaming approved for the order domain. New services must publish an OpenAPI spec
+    before development starts.
+- id: n060
+  title: Daily Notizen Dienstag
+  body: |
+    ## Punkte
+    Blocker beim Zugriff auf die Testumgebung, Ticket bei der IT eröffnet. Code-Review für
+    das Rechnungsmodul steht noch aus.
+- id: n061
+  title: One-on-one with team lead
+  body: |
+    ## Topics
+    Goals for the first quarter: two AI prototypes and a written assessment of use cases.
+    Next check-in in four weeks.
+- id: n062
+  title: Workshop Anforderungsanalyse Versicherung
+  body: |
+    ## Ergebnisse
+    Fachbereich braucht Schadensmeldungen online. Heute kommen sie per Fax und werden abgetippt.
+    Größter Schmerzpunkt ist die doppelte Datenerfassung.
+- id: n063
+  title: Incident postmortem payment outage
+  body: |
+    ## Summary
+    Payments failed for 35 minutes after a config change disabled the retry policy. Action items:
+    config review in pull requests and a canary deployment.
+- id: n064
+  title: Planung Quartal Q4
+  body: |
+    ## Themen
+    Java-Upgrade abschließen, Monitoring vereinheitlichen, zwei Kundenpiloten mit KI-Unterstützung.
+# --- people (work contacts, invented)
+- id: n065
+  title: Mara Keller
+  body: |
+    ## Role
+    Product owner for the payment platform. Prefers written proposals with numbers over meetings.
+- id: n066
+  title: Jonas Brandt
+  body: |
+    ## Rolle
+    Datenbankadministrator, Ansprechpartner für Oracle und PostgreSQL. Freigaben für
+    Schemaänderungen laufen über ihn.
+- id: n067
+  title: Leila Haddad
+  body: |
+    ## Role
+    Security officer. Must be involved before any external AI service is used with project data.
+- id: n068
+  title: Tobias Wendt
+  body: |
+    ## Rolle
+    Mainframe-Entwickler mit 30 Jahren COBOL-Erfahrung. Kennt die Buchungslogik im Detail,
+    geht nächstes Jahr in Rente.
+- id: n069
+  title: Sofia Lindqvist
+  body: |
+    ## Role
+    UX designer for the customer portal. Runs usability tests every second sprint.
+- id: n070
+  title: Peter Albers
+  body: |
+    ## Rolle
+    Leiter IT-Betrieb. Zuständig für Server, VPN und Laptop-Ausstattung.
+# --- tool howtos
+- id: n071
+  title: Rebase a feature branch
+  body: |
+    ## Steps
+    git fetch origin, git rebase origin/main, resolve conflicts, git rebase --continue, then push
+    with --force-with-lease. Never force-push shared branches.
+- id: n072
+  title: VPN Verbindung einrichten
+  body: |
+    ## Schritte
+    Client aus dem Softwarecenter installieren, Profil importieren, mit Firmenkonto und zweitem
+    Faktor anmelden. Bei Abbrüchen MTU auf 1400 setzen.
+- id: n073
+  title: Create an SSH key
+  body: |
+    ## Steps
+    ssh-keygen -t ed25519 -C "work laptop", add the public key to the Git server profile, test
+    with ssh -T. Protect the key with a passphrase.
+- id: n074
+  title: Docker ohne Root nutzen
+  body: |
+    ## Schritte
+    Rootless-Modus installieren oder Podman verwenden. Benutzer nicht in die docker-Gruppe
+    aufnehmen, das entspricht Root-Rechten.
+- id: n075
+  title: VS Code remote development
+  body: |
+    ## Setup
+    The Remote SSH extension opens projects on the build server. Extensions must be installed on
+    the remote side as well.
+- id: n076
+  title: tmux Grundbefehle
+  body: |
+    ## Befehle
+    tmux new -s name, Ctrl-b d zum Lösen, tmux attach -t name zum Zurückkehren. Fenster teilen
+    mit Ctrl-b % und Ctrl-b ".
+- id: n077
+  title: Find large files in a repository
+  body: |
+    ## Steps
+    git rev-list --objects --all piped into git cat-file --batch-check lists blob sizes. Move big
+    binaries to Git LFS.
+- id: n078
+  title: Proxy-Einstellungen für Maven und npm
+  body: |
+    ## Konfiguration
+    Maven: settings.xml mit proxy-Block. npm: npm config set proxy. Ausnahmen für interne
+    Repository-Server eintragen.
+- id: n079
+  title: Bisect a regression
+  body: |
+    ## Steps
+    git bisect start, mark a bad and a good commit, run the test at each step or automate with
+    git bisect run. Finish with git bisect reset.
+- id: n080
+  title: Zeilenenden unter Windows und Linux
+  body: |
+    ## Lösung
+    .gitattributes mit "* text=auto" anlegen. Shell-Skripte immer mit LF, sonst scheitert die
+    Ausführung mit einem kryptischen Fehler.
+- id: n081
+  title: jq cheat sheet
+  body: |
+    ## Examples
+    jq '.items[] | {id, name}' extracts fields. jq -r for raw strings. select(.status=="open")
+    filters arrays.
+- id: n082
+  title: Python virtuelle Umgebung
+  body: |
+    ## Schritte
+    uv venv im Projekt anlegen, Abhängigkeiten mit uv sync installieren. Keine Pakete global
+    mit pip installieren.
+# --- architecture decisions
+- id: n083
+  title: Modular monolith instead of microservices
+  body: |
+    ## Decision
+    The team of six keeps a modular monolith with clear module boundaries. Microservices would
+    add operational cost we cannot staff.
+- id: n084
+  title: Nachrichtenbroker Auswahl
+  body: |
+    ## Entscheidung
+    Kafka für den Auftragsstrom wegen Replay-Fähigkeit. RabbitMQ bleibt für einfache
+    Aufgabenwarteschlangen im Bestand.
+- id: n085
+  title: API versioning strategy
+  body: |
+    ## Decision
+    Version in the URL path (/v1/, /v2/). Old versions stay available for 12 months after the
+    successor is released.
+- id: n086
+  title: Caching der Produktdaten
+  body: |
+    ## Entscheidung
+    Produktdaten werden 10 Minuten im Redis-Cache gehalten. Preisänderungen invalidieren den
+    Eintrag sofort über ein Ereignis.
+- id: n087
+  title: Strangler fig pattern for the portal
+  body: |
+    ## Decision
+    New pages are served by the new frontend, a routing layer sends the rest to the legacy portal.
+    Each migrated page is switched individually.
+- id: n088
+  title: Authentifizierung über OpenID Connect
+  body: |
+    ## Entscheidung
+    Alle neuen Anwendungen melden sich über den zentralen Identity Provider mit OIDC an.
+    Eigene Benutzerverwaltungen werden nicht mehr gebaut.
+- id: n089
+  title: Feature flags
+  body: |
+    ## Decision
+    Incomplete features ship behind flags. Flags older than three months are reviewed and removed.
+- id: n090
+  title: Datenhaltung pro Service
+  body: |
+    ## Entscheidung
+    Jeder Service besitzt sein eigenes Schema. Kein Service liest direkt Tabellen eines anderen,
+    Datenaustausch nur über APIs oder Ereignisse.
+- id: n091
+  title: Choosing the frontend framework
+  body: |
+    ## Decision
+    Angular for the internal applications because of the existing team knowledge and the strict
+    structure. React only for the public website.
+- id: n092
+  title: Dateiablage in Objektspeicher
+  body: |
+    ## Entscheidung
+    Hochgeladene Dokumente gehen in einen S3-kompatiblen Objektspeicher statt in die Datenbank.
+    Die Datenbank speichert nur Metadaten und Schlüssel.
+# --- operations
+- id: n093
+  title: Centralised logging
+  body: |
+    ## Setup
+    All services log JSON to stdout. The collector ships logs to OpenSearch. Retention 30 days,
+    audit logs one year.
+- id: n094
+  title: Alarmierung und Rufbereitschaft
+  body: |
+    ## Regeln
+    Nur Alarme, die sofortiges Handeln erfordern, wecken die Rufbereitschaft. Alles andere geht
+    als Ticket in die Warteschlange.
+- id: n095
+  title: Disk full on the build server
+  body: |
+    ## Incident
+    Old Docker images filled the disk. A weekly prune job now removes images older than 14 days.
+- id: n096
+  title: Metriken mit Prometheus
+  body: |
+    ## Setup
+    Services liefern Metriken über /metrics. Dashboards in Grafana, Alarme über Alertmanager.
+    Latenz immer als Perzentile, nicht als Mittelwert.
+- id: n097
+  title: Memory leak in the document service
+  body: |
+    ## Analysis
+    Heap dumps showed an unbounded cache of rendered PDFs. Added a size limit and eviction; memory
+    stays flat now.
+- id: n098
+  title: Zeitumstellung Batchlauf doppelt
+  body: |
+    ## Vorfall
+    In der Nacht der Zeitumstellung lief der Abrechnungsjob zweimal. Scheduler auf UTC umgestellt.
+- id: n099
+  title: Runbook restart of the message consumer
+  body: |
+    ## Steps
+    Check consumer lag, pause the partition, restart the pod, verify offsets, resume. Never reset
+    offsets without approval.
+- id: n100
+  title: Kosten der Cloud-Umgebung
+  body: |
+    ## Analyse
+    Die Testumgebungen liefen auch nachts und am Wochenende. Automatisches Herunterfahren spart
+    etwa 40 % der Kosten.
+- id: n101
+  title: Tracing with OpenTelemetry
+  body: |
+    ## Setup
+    The Java agent instruments HTTP and JDBC calls. Traces show where a slow request spends its
+    time across services.
+- id: n102
+  title: Wartungsfenster Kommunikation
+  body: |
+    ## Ablauf
+    Wartungsfenster eine Woche vorher im Kundenportal ankündigen, am Vortag erinnern, danach
+    Abschlussmeldung senden.
+# --- office / admin
+- id: n103
+  title: Reisekostenabrechnung
+  body: |
+    ## Ablauf
+    Belege innerhalb von vier Wochen im Portal hochladen. Bahnfahrten zweite Klasse, Hotel bis
+    zur festgelegten Obergrenze pro Nacht.
+- id: n104
+  title: Time tracking rules
+  body: |
+    ## Rules
+    Book hours daily on the project codes. Internal work goes to the overhead code. Working
+    student hours are capped per week during lecture periods.
+- id: n105
+  title: Onboarding Checkliste
+  body: |
+    ## Erste Woche
+    Laptop abholen, Konten aktivieren, Sicherheitsschulung absolvieren, Team kennenlernen,
+    Zugang zum Ticketsystem beantragen.
+- id: n106
+  title: Ordering hardware
+  body: |
+    ## Steps
+    Request a second monitor or headset through the IT service portal. Approval by the team lead,
+    delivery within two weeks.
+- id: n107
+  title: Homeoffice Regelung
+  body: |
+    ## Stand
+    Bis zu drei Tage pro Woche mobil arbeiten nach Absprache mit dem Team. Vertrauliche
+    Unterlagen nicht in öffentlichen Räumen bearbeiten.
+- id: n108
+  title: Booking a meeting room
+  body: |
+    ## Steps
+    Rooms are booked in the calendar as resources. Large rooms need to be released if the meeting
+    is cancelled.
+- id: n109
+  title: Weiterbildung beantragen
+  body: |
+    ## Ablauf
+    Kurs mit Kosten und Nutzen beschreiben, Freigabe durch die Teamleitung, danach Anmeldung über
+    die Personalabteilung.
+- id: n110
+  title: Sick leave notification
+  body: |
+    ## Rule
+    Inform the team lead before the start of work. A doctor's certificate is required from the
+    fourth day.
+- id: n111
+  title: Urlaub eintragen
+  body: |
+    ## Ablauf
+    Urlaub im Personalportal beantragen und im Teamkalender eintragen. Vertretung vorher klären.
+- id: n112
+  title: Printing and scanning
+  body: |
+    ## Notes
+    Print jobs are released at any printer with the badge. Scanned documents go to the personal
+    mailbox.
+# --- frontend modernization
+- id: n113
+  title: AngularJS nach Angular Migration
+  body: |
+    ## Vorgehen
+    Hybridbetrieb mit ngUpgrade, Komponente für Komponente migrieren. Zuerst Services, dann
+    Direktiven, zuletzt das Routing.
+- id: n114
+  title: Accessibility audit of the customer portal
+  body: |
+    ## Findings
+    Missing labels on form fields, low contrast in the footer, keyboard focus lost in modal
+    dialogs. Target is WCAG 2.1 AA.
+- id: n115
+  title: Designsystem Komponentenbibliothek
+  body: |
+    ## Stand
+    Gemeinsame Buttons, Formularfelder und Tabellen als Bibliothek mit Storybook. Farben und
+    Abstände als Design-Tokens.
+- id: n116
+  title: Bundle size budget
+  body: |
+    ## Rule
+    The main bundle must stay under 300 kB gzipped. The build fails when the budget is exceeded.
+- id: n117
+  title: Formularvalidierung im Frontend
+  body: |
+    ## Regeln
+    Fehlermeldungen direkt am Feld, verständlich formuliert. Serverseitige Prüfung bleibt
+    trotzdem Pflicht.
+- id: n118
+  title: Internationalisation of the portal
+  body: |
+    ## Setup
+    Texts live in translation files per language. Dates and numbers are formatted with the user's
+    locale, never hard-coded.
+- id: n119
+  title: Legacy jQuery Plugins entfernen
+  body: |
+    ## Plan
+    Zwölf jQuery-Plugins im alten Portal. Sechs werden durch native Browserfunktionen ersetzt,
+    der Rest mit der Seite migriert.
+- id: n120
+  title: Usability test results checkout
+  body: |
+    ## Findings
+    Four of six users did not find the discount code field. Moved it above the total.
+# --- performance
+- id: n121
+  title: Langsame Abfrage im Berichtsmodul
+  body: |
+    ## Analyse
+    EXPLAIN ANALYZE zeigte eine verschachtelte Schleife über 2 Mio. Zeilen. Fehlender Index auf
+    dem Fremdschlüssel. Nach dem Index 300 ms statt 25 s.
+- id: n122
+  title: JVM garbage collection tuning
+  body: |
+    ## Result
+    Switching from Parallel GC to G1 reduced pause times from 1.5 s to under 200 ms for the
+    trading service. Heap fixed at 4 GB.
+- id: n123
+  title: N+1 queries in the order list
+  body: |
+    ## Fix
+    The order list loaded customers one by one. A fetch join reduced 501 queries to 1.
+- id: n124
+  title: Antwortzeiten der Suche messen
+  body: |
+    ## Methode
+    95. Perzentil über eine Woche aus den Zugriffslogs. Ziel unter 500 ms, aktuell 820 ms.
+- id: n125
+  title: Frontend performance budget
+  body: |
+    ## Targets
+    Largest contentful paint under 2.5 s on a mid-range laptop. Lazy-load images below the fold.
+- id: n126
+  title: Thread-Pool Engpass
+  body: |
+    ## Befund
+    Der HTTP-Client nutzte einen gemeinsamen Pool mit 10 Threads für alle Partner. Ein langsamer
+    Partner blockierte alle anderen. Getrennte Pools je Partner eingeführt.
+- id: n127
+  title: Batch import speed
+  body: |
+    ## Result
+    Using JDBC batch inserts with 1,000 rows per batch cut the nightly import from 3 hours to
+    25 minutes.
+- id: n128
+  title: Speicherverbrauch der Suche
+  body: |
+    ## Messung
+    Der Suchindex belegt 2,3 GB RAM. Mit komprimierten Vektoren wären es 600 MB bei kaum
+    schlechterer Trefferqualität.
+# --- reference
+- id: n129
+  title: Glossary of banking terms
+  body: |
+    ## Terms
+    Value date: the date a booking becomes effective for interest. Booking date: the date it is
+    recorded. Clearing: exchange of payment orders between banks.
+- id: n130
+  title: Abkürzungen im Projekt
+  body: |
+    ## Liste
+    PO Product Owner, FB Fachbereich, AK Abnahmekriterium, RZ Rechenzentrum, SLA Service Level
+    Agreement.
+- id: n131
+  title: Open source licence policy
+  body: |
+    ## Rules
+    MIT, Apache 2.0 and BSD are allowed. GPL components need approval because of distribution
+    obligations. Record every licence in the SBOM.
+- id: n132
+  title: Coding Conventions Java
+  body: |
+    ## Regeln
+    Google Java Style, maximale Zeilenlänge 120. Keine Wildcard-Imports. Öffentliche Methoden
+    mit Javadoc.
+- id: n133
+  title: Environments overview
+  body: |
+    ## List
+    dev (daily deploys), test (sprint builds), staging (release candidates, production-like data),
+    production. Only staging uses masked production data.
+- id: n134
+  title: Kundenprojekte Übersicht
+  body: |
+    ## Liste
+    Nordbank Kernbanksystem, Hansa Logistik Lagerverwaltung, Rheinversicherung Schadensportal.
+- id: n135
+  title: Git commit message style
+  body: |
+    ## Rules
+    Imperative mood, subject under 72 characters, reference the ticket id. Explain why in the body.
+- id: n136
+  title: Definition of Done
+  body: |
+    ## Punkte
+    Code reviewt, Tests grün, Dokumentation aktualisiert, vom Product Owner abgenommen, auf
+    Staging deployt.
+- id: n137
+  title: Service level agreements
+  body: |
+    ## Values
+    Priority 1 incidents: response in 30 minutes, 24/7. Priority 2: next business day.
+- id: n138
+  title: Markdown Vorlagen für Entscheidungen
+  body: |
+    ## Aufbau
+    Kontext, Entscheidung, Konsequenzen, Status. Eine Entscheidung pro Datei, nummeriert.
+# --- data
+- id: n139
+  title: CSV import encoding problems
+  body: |
+    ## Problem
+    Files from the customer arrive in Windows-1252, our importer expected UTF-8. German umlauts
+    were garbled. Detect the encoding before parsing.
+- id: n140
+  title: Datumsformate in Schnittstellen
+  body: |
+    ## Regel
+    Alle Schnittstellen verwenden ISO 8601 mit Zeitzone. Lokale Formate nur in der Anzeige.
+- id: n141
+  title: Data quality checks in the ETL
+  body: |
+    ## Checks
+    Row counts, null rates and duplicate keys are compared with the previous load. Deviations
+    over 5 % stop the pipeline.
+- id: n142
+  title: Stammdatenbereinigung Kunden
+  body: |
+    ## Stand
+    12 % der Kundensätze sind Dubletten. Abgleich über normalisierte Namen und Adressen,
+    manuelle Prüfung bei Unsicherheit.
+- id: n143
+  title: Anonymising production data for tests
+  body: |
+    ## Approach
+    Names and IBANs are replaced with consistent fake values so relations between tables stay
+    intact. The mapping table is deleted after the run.
+- id: n144
+  title: Excel-Export Probleme
+  body: |
+    ## Befund
+    Excel interpretiert lange Kontonummern als Zahl und schneidet Stellen ab. Spalte als Text
+    formatieren oder CSV mit Anführungszeichen erzeugen.
+- id: n145
+  title: Decimal precision in money calculations
+  body: |
+    ## Rule
+    Never use floating point for money. BigDecimal with explicit rounding mode HALF_EVEN, amounts
+    stored as integer cents in the database.
+- id: n146
+  title: Schnittstelle zum Partnerportal
+  body: |
+    ## Stand
+    REST mit OAuth2 Client Credentials. Ratenbegrenzung 100 Anfragen pro Minute. Fehlercodes
+    sind in einer separaten Tabelle dokumentiert.
+# --- extra
+- id: n147
+  title: Pair programming guidelines
+  body: |
+    ## Notes
+    Switch driver every 25 minutes. Pairing works best for complex legacy changes and onboarding.
+- id: n148
+  title: Code Review Regeln
+  body: |
+    ## Regeln
+    Jede Änderung braucht eine zweite Person. Große Änderungen in kleine Pull Requests aufteilen,
+    höchstens 400 Zeilen.
+- id: n149
+  title: Technical debt register
+  body: |
+    ## Entries
+    Each debt item has an owner, estimated cost and the risk if ignored. Reviewed every quarter.
+- id: n150
+  title: Kundenkommunikation bei Verzögerungen
+  body: |
+    ## Regel
+    Verzögerungen sofort melden, mit neuem Termin und Grund. Keine Versprechen ohne Rücksprache
+    mit dem Team.
+- id: n151
+  title: Docker Compose for local development
+  body: |
+    ## Setup
+    docker compose up starts database, message broker and mock services. Seed data is loaded
+    from a script on first start.
+- id: n152
+  title: Wissensübergabe vor Renteneintritt
+  body: |
+    ## Plan
+    Wöchentliche Sitzungen mit dem erfahrenen Entwickler, Aufzeichnung der Erklärungen,
+    Ergebnisse als Notizen und Diagramme sichern.
+- id: n153
+  title: Architecture decision records
+  body: |
+    ## Practice
+    Every significant decision is written as a short ADR with context, decision and consequences.
+    Superseded ADRs stay in the repository with their new status.
+- id: n154
+  title: Sprachmodelle Kosten vergleichen
+  body: |
+    ## Messung
+    Kosten pro 1000 Anfragen für drei Modelle gemessen. Das kleinste Modell war 20-mal billiger
+    und bei Klassifikation gleich gut.
+
+queries:
+# German queries
+- {q: "Welche Programme hängen von gemeinsam genutzten Datenstrukturen im Host ab?", rel: [n002]}
+- {q: "Umlaute kaputt beim Export vom Großrechner", rel: [n004]}
+- {q: "Unterschied leerer String und NULL nach Datenbankwechsel", rel: [n014, n013]}
+- {q: "Wie lange dauert die Wiederherstellung einer Sicherung?", rel: [n016]}
+- {q: "zu wenige Datenbankverbindungen zur Mittagszeit", rel: [n017]}
+- {q: "Tests schlagen um Mitternacht fehl", rel: [n030]}
+- {q: "Schlüssel versehentlich eingecheckt, was tun?", rel: [n038]}
+- {q: "Zertifikat abgelaufen, Partner nicht erreichbar", rel: [n039]}
+- {q: "Darf ich Kundendaten in einen KI-Chat kopieren?", rel: [n048]}
+- {q: "Wie bewerten wir, ob sich ein KI-Projekt lohnt?", rel: [n052]}
+- {q: "Was hat die Produktverantwortliche für Zahlungen für Vorlieben?", rel: [n065]}
+- {q: "Wer gibt Änderungen am Datenbankschema frei?", rel: [n066, n018]}
+- {q: "Branch auf den aktuellen Hauptzweig aktualisieren", rel: [n071]}
+- {q: "Fehlersuche welcher Commit hat es kaputt gemacht", rel: [n079]}
+- {q: "Warum Monolith statt vieler kleiner Dienste?", rel: [n083]}
+- {q: "Wie lange bleiben alte API-Versionen verfügbar?", rel: [n085]}
+- {q: "Festplatte auf dem Build-Server voll", rel: [n095]}
+- {q: "Abrechnung lief in der Nacht der Sommerzeit zweimal", rel: [n098]}
+- {q: "zweiten Bildschirm bestellen", rel: [n106]}
+- {q: "Barrierefreiheit Kundenportal Mängel", rel: [n114]}
+- {q: "Pausenzeiten des Garbage Collectors verringern", rel: [n122]}
+- {q: "Zu viele SQL-Abfragen beim Laden der Bestellungen", rel: [n123]}
+- {q: "Geldbeträge richtig runden", rel: [n145]}
+- {q: "Welche Open-Source-Lizenzen sind erlaubt?", rel: [n131]}
+- {q: "Wissen des COBOL-Kollegen sichern bevor er geht", rel: [n152, n068]}
+# English queries
+- {q: "how many nightly batch programs does the host run", rel: [n001]}
+- {q: "should we keep the mainframe code or rewrite it", rel: [n003]}
+- {q: "script engine removed in newer Java versions", rel: [n007]}
+- {q: "security config changes when moving to Spring Boot 3", rel: [n010]}
+- {q: "trigram index to speed up name search", rel: [n015]}
+- {q: "two transactions lock rows in different order", rel: [n019]}
+- {q: "where do we store CI credentials", rel: [n026]}
+- {q: "golden master tests before refactoring pricing logic", rel: [n029]}
+- {q: "tests pass but assertions are weak, surviving mutants", rel: [n031]}
+- {q: "replace H2 with a real database in integration tests", rel: [n032]}
+- {q: "brute force protection missing on login", rel: [n040]}
+- {q: "how often do managers review user permissions", rel: [n042]}
+- {q: "upgrade old password hashes", rel: [n044]}
+- {q: "AI summaries of long ticket histories", rel: [n046]}
+- {q: "how fast is a small language model on a laptop CPU", rel: [n050]}
+- {q: "customer wants the online banking part first", rel: [n057]}
+- {q: "what went wrong in the payment outage", rel: [n063]}
+- {q: "who decides before we use an external AI service with project data", rel: [n067, n048]}
+- {q: "keep docker without root privileges", rel: [n074]}
+- {q: "git line endings break shell scripts", rel: [n080]}
+- {q: "Kafka or RabbitMQ for orders", rel: [n084]}
+- {q: "migrate portal page by page behind a router", rel: [n087]}
+- {q: "cloud test environments cost too much at night", rel: [n100]}
+- {q: "travel expense receipts deadline", rel: [n103]}
+- {q: "how many days can I work from home", rel: [n107]}
+- {q: "move from AngularJS step by step", rel: [n113]}
+- {q: "customer files have wrong character encoding", rel: [n139, n004]}
+- {q: "Excel cuts off long account numbers", rel: [n144]}
+- {q: "fake but consistent names and IBANs in test data", rel: [n143]}
+- {q: "cheaper model just as good for classification", rel: [n154]}
+# Identifier / keyword queries (exact terms a user remembers)
+- {q: "HikariCP maximumPoolSize", rel: [n017], kind: keyword}
+- {q: "ora2pg", rel: [n013], kind: keyword}
+- {q: "pg_trgm", rel: [n015], kind: keyword}
+- {q: "surefire reuseForks", rel: [n011], kind: keyword}
+- {q: "WCAG 2.1 AA", rel: [n114], kind: keyword}
+- {q: "CycloneDX", rel: [n043], kind: keyword}
+- {q: "Argon2id", rel: [n044], kind: keyword}
+- {q: "gitleaks", rel: [n038], kind: keyword}
+- {q: "ReentrantLock", rel: [n012], kind: keyword}
+- {q: "Codepage 273", rel: [n004], kind: keyword}
+- {q: "Pact broker", rel: [n033], kind: keyword}
+- {q: "ngUpgrade", rel: [n113], kind: keyword}
+- {q: "HALF_EVEN", rel: [n145], kind: keyword}
+- {q: "k6", rel: [n035], kind: keyword}
+- {q: "OpenRewrite", rel: [n008], kind: keyword}
+- {q: "MTU 1400", rel: [n072], kind: keyword}
+- {q: "distroless", rel: [n027], kind: keyword}

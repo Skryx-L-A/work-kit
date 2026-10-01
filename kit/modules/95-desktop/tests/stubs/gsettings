@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Test stub of gsettings over the dconf stub database. Defaults in $FAKE_DEFAULTS.
+set -eu
+[ "$1" = --schemadir ] && shift 2
+cmd="$1"; schema="$2"; key="${3:-}"
+case "$schema" in
+  *:*) path="${schema#*:}$key" ;;
+  *) path="/$(printf '%s' "$schema" | tr '.' '/')/$key" ;;
+esac
+d="$(dirname "$0")"
+case "$cmd" in
+  get) v="$("$d/dconf" read "$path")"
+       [ -n "$v" ] || v="$(grep -F "$path=" "${FAKE_DEFAULTS:-/dev/null}" 2>/dev/null | head -n 1 | cut -d= -f2-)"
+       printf '%s\n' "${v:-@as []}" ;;
+  set) "$d/dconf" write "$path" "$4" ;;
+  reset) "$d/dconf" reset "$path" ;;
+  writable) if grep -qxF "$path" "${FAKE_LOCKS:-/dev/null}" 2>/dev/null; then echo false; else echo true; fi ;;
+  *) echo "stub gsettings: unsupported $*" >&2; exit 2 ;;
+esac

@@ -1,0 +1,14 @@
+# data-guard deny-list: one extended regular expression per line, matched case-insensitively
+# against every added line and every file path in a commit. Blank lines and lines starting
+# with # are ignored. Matching is done by `grep -E`.
+#
+# Put customer names, internal hostnames, internal paths and project code names here.
+# Do not put real secrets here. This file stays on your machine.
+#
+# A line that ends in a `data-guard:allow` comment is skipped.
+#
+# Examples (remove the leading # to activate):
+# customer-name-one
+# \.corp\.example\.net
+# /srv/customers/
+# TODO(ask IT): fill in customer names and internal hostnames.

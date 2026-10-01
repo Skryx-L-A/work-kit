@@ -1,0 +1,15 @@
+[
+  ["RE-2026-0412", "{\"invoice_number\": \"RE-2026-0412\", \"total_eur\": 1284.50, \"date\": \"2026-08-14\"}"],
+  ["export button crashes", "bug"],
+  ["Support hat mein Problem", "positiv"],
+  ["Review-Meeting", "Das Review-Meeting zur Datenbankmigration ist auf Donnerstag, 14 Uhr, in Raum B verschoben."],
+  ["The backup failed", "Die Sicherung ist fehlgeschlagen, weil die Festplatte voll war."],
+  ["Bitte prüfen Sie", "Please check the configuration before you restart the service."],
+  ["12 Module pro Woche", "8"],
+  ["sum(i * i", "30"],
+  ["COBOL batch system", "- Hidden business rules in old code\n- Different numeric precision\n- Batch timing changes"],
+  ["slugify", "```python\nimport re\n\ndef slugify(text: str) -> str:\n    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')\n```"],
+  ["table named orders", "SELECT customer, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY customer ORDER BY total DESC;"],
+  ["Geschäftsführerin", "NICHT IM TEXT"],
+  ["In welcher Stadt", "Kassel"]
+]

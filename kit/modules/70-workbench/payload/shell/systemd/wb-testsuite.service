@@ -1,0 +1,78 @@
+# wb-testsuite.service -- systemd-user Gegenstueck zum macOS-launchd-Job
+# agent-workbench.wb-testsuite (siehe ../agent-workbench.wb-testsuite.plist). Faehrt
+# denselben Wrapper wie der Mac (shell/wb-testsuite-run) unveraendert und
+# schreibt dieselbe Statusdatei an denselben Ort
+# (~/.local/state/wb-testsuite-status.txt), damit der SessionStart-Hook
+# sessionstart-testsuite-status.sh dort ohne jede Anpassung funktioniert.
+#
+# ExecStart zeigt bewusst auf den REPO-Pfad statt auf eine Kopie unter
+# ~/.local/bin -- aus demselben Grund wie im Kopfkommentar der Mac-plist:
+# shell/tests/run-all.sh sammelt seine Suiten relativ zu seinem eigenen
+# Verzeichnis (Geschwister-Dateien test-*.sh/.py); eine isolierte Kopie
+# haette diese Geschwister nicht und liefe leer oder falsch.
+#
+# `/bin/bash -lc` statt eines nackten ExecStart auf den Wrapper: npm haengt
+# auf host2 an nvm (~/.nvm/versions/node/<version>/bin), das nur ueber die
+# geladene ~/.bashrc auf PATH landet. Ein systemd-user-Service startet ohne
+# Login-Shell und ohne dieses PATH -- ohne den Umweg faende
+# shell/tests/run-all.sh kein npm und wuerde den extension/-Check still auf
+# SKIP setzen statt ihn auszufuehren. Geprueft (2026-08-04, read-only auf
+# host2): `bash -lc 'command -v npm'` findet npm ueber genau diesen Pfad, ein
+# nackter Exec-Aufruf nicht (leeres PATH ohne ~/.nvm/.../bin).
+#
+# Installation: siehe README.md in diesem Ordner.
+
+[Unit]
+Description=wb-testsuite: woechentlicher Lauf von shell/tests/run-all.sh (systemd-Gegenstueck zu agent-workbench.wb-testsuite)
+
+[Service]
+Type=oneshot
+# OHNE GRAFIK-UMGEBUNG, SONST STIRBT ELECTRON (23.08.2026, gemessen).
+# Der systemd-user-Manager traegt die Variablen der angemeldeten
+# Wayland-Sitzung (DISPLAY=:0, WAYLAND_DISPLAY=wayland-0, XAUTHORITY=...),
+# und ein Dienst erbt sie. Die App-Suiten starten Electron aber mit einem
+# Wegwerf-HOME; Electron sieht dann WAYLAND_DISPLAY, versucht sich zu
+# verbinden, findet den Socket in diesem Kontext nicht und beendet sich mit
+# SIGSEGV statt auf den headless-Weg auszuweichen:
+#   Failed to connect to Wayland display: Datei oder Verzeichnis nicht gefunden
+#   The platform failed to initialize.  Exiting.
+#   electron exited with signal SIGSEGV
+# Gemessen am 23.08.: derselbe Lauf ueber diesen Dienst 200/51 (alle 51 rot
+# sind test-app-*), ueber eine SSH-Sitzung OHNE diese Variablen 5/5 gruen fuer
+# dieselbe Suite.
+#
+# ZWEI VERSUCHE LAGEN DANEBEN, BEIDE GEMESSEN -- der Weg dahin gehoert dazu,
+# damit ihn niemand noch einmal geht:
+#   1. `Environment=WAYLAND_DISPLAY=` (leergesetzt): blieb bei 200/51. Electron
+#      fragt, OB die Variable da ist, nicht was drinsteht -- ein leerer Wert
+#      ist gesetzt.
+#   2. `UnsetEnvironment=WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_RUNTIME_DIR`:
+#      blieb bei 199/52, mit derselben Wayland-Fehlermeldung. Die Probe zeigte
+#      warum -- WAYLAND_DISPLAY war tatsaechlich weg, aber `XDG_SESSION_TYPE=
+#      wayland` stand noch da. Chromium waehlt seine Plattform danach und
+#      sucht dann einen Socket, den es in diesem Kontext nicht gibt.
+# Die Sitzungsvariablen ueberleben, weil ExecStart eine ANMELDE-Shell startet
+# (`bash -lc`, noetig fuer nvm/npm, siehe Kommentar oben) und die ihr Profil
+# laedt. Deshalb muessen sie hier weg, nicht nur die drei offensichtlichen.
+# Gegenprobe gefahren (23.08.): derselbe Dienst, dieselbe Suite, mit dieser
+# Zeile 5/5 gruen statt SIGSEGV.
+UnsetEnvironment=WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_SESSION_CLASS XDG_SESSION_PATH XDG_SESSION_ID QT_WAYLAND_RECONNECT
+Environment=WB_REPO_SHELL=%h/work/kit/modules/70-workbench/payload/shell
+ExecStart=/bin/bash -lc '%h/.local/bin/wb-testsuite-run'
+StandardOutput=append:%h/.local/state/wb-testsuite-run.log
+StandardError=append:%h/.local/state/wb-testsuite-run.log
+# DER LAUF IST FERTIG, BEVOR DIE KONTROLLGRUPPE LEER IST (23.08., gemessen).
+# Der Wrapper hatte seine Statusdatei um 03:22:40 geschrieben, 255/0, Exit 0 --
+# und trotzdem meldete systemd 45 Sekunden spaeter `Failed with result
+# 'timeout'` und schoss mit SIGABRT nach (das Journal zeigt den Stack eines
+# tmux-Prozesses). Es haengt also nach dem Lauf noch ein tmux-Server in der
+# Gruppe, auf den systemd wartet. Das ist derselbe Rest, den die Waisen-Spur
+# auf dem Mac verfolgt -- hier faellt er nur eher auf, weil eine Kontrollgruppe
+# ihn festhaelt, statt ihn an PID 1 zu verlieren.
+# `KillMode=mixed` schickt das Stopsignal an den Hauptprozess und raeumt den
+# Rest der Gruppe danach ab, statt auf jeden Nachzuegler zu warten; die kurze
+# Frist begrenzt, wie lange ein solcher Rest den Dienst als gescheitert
+# dastehen laesst. Die URSACHE bleibt damit unbehoben -- sie gehoert zur
+# Waisen-Spur, nicht hierher; behoben ist nur die falsche Meldung darueber.
+KillMode=mixed
+TimeoutStopSec=20

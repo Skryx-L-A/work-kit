@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""kit-statusline: one status line for Claude Code (statusLine command, JSON on stdin).
+
+  <role> · <model> <effort> · <dir> <branch> · ctx 85k/1.0M (8%) · [CAVEMAN]
+
+The caveman badge comes from kit module 31-caveman's own script when it is installed.
+`kit-statusline --plain` prints the same without colors (tests, other harnesses).
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "guard" / "lib"))
+try:
+    from checks import current_role  # noqa: E402
+except Exception:
+    def current_role(harness=""):
+        return os.environ.get("KIT_AGENT_ROLE", "")
+
+PLAIN = "--plain" in sys.argv or os.environ.get("NO_COLOR")
+DIM, CYN, GRN, YLW, RED, RST = (("",) * 6) if PLAIN else ("\033[2m", "\033[36m", "\033[32m", "\033[33m",
+                                                          "\033[31m", "\033[0m")
+SEP = "%s · %s" % (DIM, RST)
+
+
+def data_dir() -> Path:
+    return Path(os.environ.get("KIT_DATA_DIR") or Path.home() / ".local/share/work-kit")
+
+
+def caveman_badge() -> str:
+    script = data_dir() / "caveman/upstream/src/hooks/caveman-statusline.sh"
+    if not script.is_file():
+        return ""
+    try:
+        r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=2, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    out = r.stdout.strip()
+    if PLAIN:
+        import re
+        out = re.sub(r"\033\[[0-9;]*m", "", out)
+    return out
+
+
+def token_count(value: int | float) -> str:
+    value = int(value)
+    if value >= 1_000_000:
+        return "%.1fM" % (value / 1_000_000)
+    if value >= 1_000:
+        return "%dk" % (value // 1_000)
+    return str(value)
+
+
+def main() -> int:
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        d = {}
+    model = ((d.get("model") or {}).get("display_name") or "").split(" ")[0]
+    effort = ((d.get("effort") or {}).get("level") or "")
+    if model and effort:
+        model = "%s %s" % (model, effort)
+    cwd = (d.get("workspace") or {}).get("current_dir") or d.get("cwd") or os.getcwd()
+    try:
+        branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True,
+                                timeout=2).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        branch = ""
+    home = str(Path.home())
+    sdir = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+    if len(sdir) > 32:
+        sdir = ".../" + "/".join(Path(cwd).parts[-2:])
+    parts = []
+    role = current_role("claude")
+    if role in ("lead", "worker"):
+        parts.append("%s%s%s" % (CYN, role, RST))
+    if model:
+        parts.append(model)
+    parts.append(sdir + ((" %s%s%s" % (DIM, branch, RST)) if branch else ""))
+    cw = d.get("context_window") or {}
+    used, size = cw.get("total_input_tokens"), cw.get("context_window_size")
+    if isinstance(used, (int, float)) and isinstance(size, (int, float)) and size > 0:
+        pct = int(used * 100 / size)
+        col = RED if pct >= 85 else YLW if pct >= 60 else GRN
+        parts.append("%sctx %s/%s (%d%%)%s" % (col, token_count(used), token_count(size), pct, RST))
+    badge = caveman_badge()
+    if badge:
+        parts.append(badge)
+    print(SEP.join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+# 01-prereqs portable downloads: sha256  path-under-offline/prereqs  url
+# Checked 2026-09-25 against the publisher's value: VS Code from
+# update.code.visualstudio.com/api/versions/<version>/linux-x64/stable (sha256hash),
+# Node.js from nodejs.org/dist/<version>/SHASUMS256.txt. Change a line only after the same check.
+ef18461d14d658255917ea978cdccb20576f797af8d9f6062e6ac5afa9f5ec51  vscode/code-stable-x64-1.139.0.tar.gz  https://vscode.download.prss.microsoft.com/dbazure/download/stable/2242ebbb54efeeb0129e08e919e7e8d43033cd83/code-stable-x64-1790091292.tar.gz
+fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  node/node-v24.21.0-linux-x64.tar.xz  https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz

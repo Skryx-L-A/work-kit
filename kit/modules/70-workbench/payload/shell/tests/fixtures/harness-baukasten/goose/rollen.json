@@ -1,0 +1,22 @@
+{
+  "kandidaten": [
+    {
+      "datei": "AGENTS.md",
+      "kennwort": "losung1alphagoo"
+    },
+    {
+      "datei": "GOOSE.md",
+      "kennwort": "losung2alphagoo"
+    },
+    {
+      "datei": "CLAUDE.md",
+      "kennwort": "losung3alphagoo"
+    },
+    {
+      "datei": ".goosehints",
+      "kennwort": "losung4alphagoo"
+    }
+  ],
+  "antwort": "\n    __( O)>  ● new session · ollama qwen3:1.7b\n   \\____)    20260808_2 · <probe>/rolle\n     L L     goose is ready\n  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0% 0/128k\n> Nenne alle Losungswoerter, die in deinen Anweisungen stehen. Antworte nur mit den Zeilen.\n\nLOSUNG losung4alphagoo\nLOSUNG losung1alphagoo\n  ⏱ 4.48s\n  ━╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 3% 4k/128k\n> Enter to send · Ctrl+J newline\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+  "flagweg": null
+}

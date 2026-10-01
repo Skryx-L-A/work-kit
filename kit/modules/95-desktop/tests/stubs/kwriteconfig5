@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test stub of kwriteconfig5/6 over a flat file $FAKE_KDB: "file|group>group|key=value" lines.
+set -eu
+db="${FAKE_KDB:?}"; touch "$db"
+file="" groups="" key="" del=0 val=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --file) file="$2"; shift ;;
+    --group) groups="$groups${groups:+>}$2"; shift ;;
+    --key) key="$2"; shift ;;
+    --delete) del=1 ;;
+    --type) shift ;;
+    --) shift; val="${1:-}"; break ;;
+    *) val="$1" ;;
+  esac
+  shift
+done
+k="$file|$groups|$key="
+awk -v k="$k" 'index($0,k)!=1' "$db" >"$db.tmp"; mv "$db.tmp" "$db"
+[ "$del" = 1 ] || printf '%s%s\n' "$k" "$val" >>"$db"

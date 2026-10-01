@@ -1,0 +1,50 @@
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                         │
+│   ▐█▛█▛█▌  Welcome to Kimi Code CLI!                                                                    │
+│   ▐█████▌  Send /help for help information.                                                             │
+│                                                                                                         │
+│  Directory: <probe>/sitzung-a  │
+│  Session: <sitzung>                                                          │
+│  Model: qwen3:1.7b                                                                                      │
+│  Tip: send /login to use Kimi for Coding                                                                │
+│                                                                                                         │
+│  ✨ Update: The new Kimi Code is here — rebuilt to be faster and more powerful.                         │
+│  Run /upgrade; your config & sessions carry over.                                                       │
+│                                                                                                         │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+✨ Merke dir das Wort merkwort-plumbus und antworte nur mit OK.
+
+🌒
+
+── input ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+yolo  afk  agent (qwen3:1.7b ○)  …arness-probe.Vwaawm/sitzung-a  ctrl-x: toggle mode | shift-tab: plan mode
+                                                                                                                                                                                context: 0.0% (0/262.1k)

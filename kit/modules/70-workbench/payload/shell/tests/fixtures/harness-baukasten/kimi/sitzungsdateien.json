@@ -1,0 +1,8 @@
+[
+  {
+    "pfad": "~/.kimi/sessions/<hash>/<sitzung>/context.jsonl",
+    "hat_tokenzahlen": true,
+    "formatvorschlag": null,
+    "beleg": "{\"role\": \"_usage\", \"token_count\": 10480}"
+  }
+]

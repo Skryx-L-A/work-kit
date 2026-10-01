@@ -1,0 +1,114 @@
+#!/bin/bash
+# wb-mail — send a short mail from an unattended job.
+#
+#   wb-mail [-a <konto>] [-A <datei>]... [-r <message-id>] <to> <subject> <bodyfile>
+#
+# -r haengt die Mail als ANTWORT in den bestehenden Verlauf: In-Reply-To und
+# References werden gesetzt, und dem Betreff wird ein 'Re: ' vorangestellt,
+# falls es noch fehlt.
+#
+# Konten stehen in ~/.msmtprc:
+#   gmail  you@example.com   (Voreinstellung)
+#   gmx    second@example.net
+#
+# Uses msmtp when it is configured (~/.msmtprc), because macOS' own sendmail is
+# not set up to relay to the internet — mail handed to it would queue forever.
+# Without msmtp this exits 3 and says so, so a caller can fall back (e.g. a Gmail
+# draft via the connector) instead of believing a mail was sent.
+#
+# Die Absenderzeile wird aus dem gewaehlten Konto gesetzt, damit Kopf und
+# Briefumschlag zusammenpassen — GMX weist eine Mail sonst zurueck.
+set -uo pipefail
+
+ACCOUNT=""
+INREPLYTO=""
+ATTACH=()
+while true; do
+  case "${1:-}" in
+    -a) ACCOUNT="${2:?Kontoname nach -a}"; shift 2 ;;
+    -A) [ -s "${2:?Dateipfad nach -A}" ] || { echo "wb-mail: Anhang fehlt oder ist leer: ${2}" >&2; exit 1; }
+        ATTACH+=("$2"); shift 2 ;;
+    -r) INREPLYTO="${2:?Message-ID nach -r}"; shift 2 ;;
+    *)  break ;;
+  esac
+done
+
+TO="${1:?to}"; SUBJ="${2:?subject}"; BODY="${3:?bodyfile}"
+[ -s "$BODY" ] || { echo "wb-mail: Body-Datei fehlt oder ist leer: $BODY" >&2; exit 1; }
+
+if [ -n "$INREPLYTO" ]; then
+  case "$SUBJ" in Re:*|RE:*|AW:*|Aw:*) ;; *) SUBJ="Re: $SUBJ" ;; esac
+fi
+
+MSMTP="$(command -v msmtp || true)"
+if [ -z "$MSMTP" ] || [ ! -f "$HOME/.msmtprc" ]; then
+  echo "wb-mail: kein konfigurierter Sendeweg (msmtp fehlt oder ~/.msmtprc nicht vorhanden) — nichts gesendet." >&2
+  exit 3
+fi
+
+# Ohne -a bleibt es beim Standardkonto der Konfiguration.
+ACC_ARGS=()
+LOOKUP="$ACCOUNT"
+if [ -n "$ACCOUNT" ]; then
+  if ! grep -qE "^account[[:space:]]+$ACCOUNT([[:space:]]*:.*)?$" "$HOME/.msmtprc"; then
+    echo "wb-mail: Konto '$ACCOUNT' steht nicht in ~/.msmtprc." >&2
+    exit 4
+  fi
+  ACC_ARGS=(-a "$ACCOUNT")
+else
+  LOOKUP="$(awk '/^account default/ {print $NF}' "$HOME/.msmtprc" | tail -1)"
+fi
+
+# Absenderadresse des gewaehlten Kontos aus der Konfiguration lesen.
+FROM="$(awk -v acc="$LOOKUP" '
+  $1=="account" && $2==acc {inacc=1; next}
+  $1=="account" {inacc=0}
+  inacc && $1=="from" {print $2; exit}
+' "$HOME/.msmtprc")"
+
+# NUR-LESEN-ADRESSEN (2026-08-31, Vorgabe des Nutzers). Manche Adressen werden gelesen,
+# aber nie von einem Agenten beschickt. Die Sperre steht hier und nicht nur in einer
+# Regel, damit sie auch dann greift, wenn jemand von Hand ein passendes Konto anlegt.
+case "$FROM" in
+  readonly@example.org)
+    echo "wb-mail: '$FROM' ist eine Nur-Lese-Adresse, von hier wird nicht gesendet." >&2
+    exit 5 ;;
+esac
+
+if [ ${#ATTACH[@]} -eq 0 ]; then
+  MESSAGE() {
+    [ -n "$FROM" ] && printf 'From: %s\n' "$FROM"
+    [ -n "$INREPLYTO" ] && printf 'In-Reply-To: %s\nReferences: %s\n' "$INREPLYTO" "$INREPLYTO"
+    printf 'To: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n' "$TO" "$SUBJ"
+    cat "$BODY"
+  }
+else
+  # Mit Anhang wird die Nachricht von Python gebaut: Kopfzeilen korrekt kodiert,
+  # MIME-Typ aus der Dateiendung, Dateiname bleibt erhalten.
+  MESSAGE() {
+    FROM="$FROM" TO="$TO" SUBJ="$SUBJ" BODY="$BODY" INREPLYTO="$INREPLYTO" python3 - "${ATTACH[@]}" <<'PYEOF'
+import mimetypes, os, sys
+from email.message import EmailMessage
+m = EmailMessage()
+if os.environ.get("FROM"): m["From"] = os.environ["FROM"]
+m["To"] = os.environ["TO"]
+m["Subject"] = os.environ["SUBJ"]
+if os.environ.get("INREPLYTO"):
+    m["In-Reply-To"] = os.environ["INREPLYTO"]
+    m["References"] = os.environ["INREPLYTO"]
+m.set_content(open(os.environ["BODY"], encoding="utf-8").read())
+for path in sys.argv[1:]:
+    typ, _ = mimetypes.guess_type(path)
+    maj, _, sub = (typ or "application/octet-stream").partition("/")
+    with open(path, "rb") as fh:
+        m.add_attachment(fh.read(), maintype=maj, subtype=sub,
+                         filename=os.path.basename(path))
+sys.stdout.write(m.as_string())
+PYEOF
+  }
+fi
+
+# bash 3.2 auf macOS behandelt ein LEERES Array unter `set -u` als unbound: ohne `-a`
+# brach jeder Aufruf mit "ACC_ARGS[@]: unbound variable" ab (gemessen 2026-08-22).
+MESSAGE | "$MSMTP" ${ACC_ARGS[@]+"${ACC_ARGS[@]}"} --read-recipients \
+  && echo "wb-mail: gesendet an $TO${FROM:+ (von $FROM)}${ATTACH:+ mit ${#ATTACH[@]} Anhang/Anhaengen}"

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# wb-brain-zeile <verzeichnis> [<verzeichnis> ...]
+#
+# Prints the kbase sentence that pi-worker puts in front of every task's
+# [Protokoll] instruction. Default: workers must run `brain search` before their
+# first change (Kbase-Messung 24.09.2026: Claude-Worker suchten nur in 9 % der
+# Faelle von selbst).
+#
+# Exception (der Nutzer, 25.09.2026, Anlass ~/work-kit): a project that must
+# stay free of private data -- e.g. a kit that ends up on a company laptop -- must
+# not pull anything from the private kbase ~/work/brain. Such a project carries a
+# file named `.wb-ohne-brain` in its directory or in any parent up to (but not
+# including) $HOME. Then the sentence FORBIDS the kbase instead of requiring it;
+# a plain omission would leave the general rule in CLAUDE.md ("Vor nichttrivialer
+# Arbeit brain search") in force.
+#
+# Every given directory is checked, because a worker may run in a worktree
+# (~/.pi-workers/worktrees/<name>) whose parents are not the project's: pi-worker
+# passes the original project directory AND the working directory. A tracked
+# marker also appears inside the worktree; an untracked one only in the original.
+set -u
+
+MARKE=".wb-ohne-brain"
+
+ohne_brain() {
+  local d heim
+  heim="$(cd "$HOME" 2>/dev/null && pwd -P)" || heim="$HOME"
+  for d in "$@"; do
+    [ -n "$d" ] || continue
+    d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$heim" ]; do
+      [ -e "$d/$MARKE" ] && return 0
+      d="$(dirname "$d")"
+    done
+  done
+  return 1
+}
+
+# Kit version (work-kit 70-workbench): switchable and in English, for the kit brain
+# (module 20-brain). First match wins:
+#   1. project:  a file .wb-ohne-brain in the folder or a parent below $HOME means off, always:
+#                a project marked without brain never gets brain content, not even with
+#                --brain on (owner rule; acceptance review 2026-09-27)
+#   2. task:     WB_BRAIN_STEP=on|off (set by `pi-worker --brain` / `claude-worker --brain`)
+#   3. setting:  wb-state settings set workerBrainStep on|off
+#   4. default:  on when the `brain` CLI is installed, otherwise off
+# Off prints one sentence that overrides the general "search the brain first" rule of the
+# kit AGENTS.md; a missing CLI prints nothing, so the protocol has no search step.
+if ohne_brain "$@"; then
+  printf '%s' "No knowledge-base search for this task: the project is kept free of brain content (file $MARKE). Do not run brain search and do not copy anything from the brain into project files, even if a general rule or the task asks for it."
+  exit 0
+fi
+wahl="${WB_BRAIN_STEP:-}"
+[ -n "$wahl" ] || wahl="$("$HOME/.local/bin/wb-state" settings get workerBrainStep 2>/dev/null || true)"
+case "$wahl" in
+  off|false|0)
+    printf '%s' "No knowledge-base search for this task (brain step switched off): do not run brain search." ;;
+  *)
+    if command -v brain >/dev/null 2>&1 || [ -x "$HOME/.local/bin/brain" ]; then
+      printf '%s' "Before the first change: run brain search \"<topic of the task>\" -k 5 and read the matching notes."
+    fi ;;
+esac

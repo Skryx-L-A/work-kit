@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Test stub of kreadconfig5/6 over $FAKE_KDB (see kwriteconfig5).
+set -eu
+db="${FAKE_KDB:?}"; touch "$db"
+file="" groups="" key="" def=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --file) file="$2"; shift ;; --group) groups="$groups${groups:+>}$2"; shift ;;
+    --key) key="$2"; shift ;; --default) def="$2"; shift ;;
+  esac
+  shift
+done
+v="$(awk -v k="$file|$groups|$key=" 'index($0,k)==1 {print substr($0,length(k)+1); f=1; exit} END {if (!f) exit 1}' "$db")" && { printf '%s\n' "$v"; exit 0; }
+printf '%s\n' "$def"

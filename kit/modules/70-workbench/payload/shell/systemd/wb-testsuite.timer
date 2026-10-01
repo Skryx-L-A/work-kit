@@ -1,0 +1,27 @@
+# wb-testsuite.timer -- feuert wb-testsuite.service woechentlich, Sonntag
+# 04:00 Uhr lokale Zeit (Wahl des Nutzers am 22.08.2026: nachts stoert der Lauf
+# weder ihn noch einen anderen Prozess -- vorher lag er Sonntag 20:00).
+#
+# KEIN Gegenstueck auf dem Mac mehr: dort sind am 22.08.2026 alle zehn
+# LaunchAgents mit Zeitplan abgeschaltet worden, wb-testsuite eingeschlossen
+# (Ansage des Nutzers: "Mac keine automatischen Laeufe, die sich wiederholen";
+# der Orchestrator stoesst die Laeufe dort selbst an). host2 behaelt seine
+# Timer ausdruecklich -- die Maschine steht ohnehin durch, und niemand sitzt
+# nachts davor.
+#
+# Persistent=true holt einen verpassten Lauf nach, sobald der Timer als
+# naechstes aktiv wird (z.B. Maschine war Sonntag 20:00 aus) -- eine
+# Verbesserung gegenueber der Mac-Seite (launchds StartCalendarInterval holt
+# verpasste Termine nicht automatisch nach), aendert aber nichts am normalen
+# woechentlichen Rhythmus.
+
+[Unit]
+Description=Woechentlicher Timer fuer wb-testsuite.service
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+Unit=wb-testsuite.service
+
+[Install]
+WantedBy=timers.target

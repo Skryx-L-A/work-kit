@@ -1,0 +1,5 @@
+Sonderzeichen-Probe: `backtick` $(echo NEIN) ${HOME} "doppelt" 'einfach' \Rueckstrich
+Umlaute: äöüÄÖÜß — Gedankenstrich, „Anfuehrung", 100 % & < > | ; * ?
+Pfad mit Leerzeichen: $HOME/Mein Ordner/Datei mit Leerzeichen.md
+Fehlermeldung: error[E0308]: mismatched types --> src/main.rs:12:9
+Tabulator:	danach. Ende.

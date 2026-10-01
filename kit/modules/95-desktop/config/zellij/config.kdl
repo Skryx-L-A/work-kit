@@ -1,0 +1,5 @@
+// Zellij config from work-kit 95-desktop. Theme file: ~/.config/zellij/themes/work-kit.kdl
+theme "work-kit"
+pane_frames false
+default_layout "compact"
+show_startup_tips false

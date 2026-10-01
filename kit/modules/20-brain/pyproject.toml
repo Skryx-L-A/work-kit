@@ -1,0 +1,35 @@
+[project]
+name = "kitbrain"
+version = "0.1.0"
+description = "brain: local Markdown knowledge base with hybrid search (SQLite FTS5 + ONNX embeddings)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "onnxruntime>=1.18",
+    "pypdf>=5.0",
+    "pyyaml>=6.0",
+    "tokenizers>=0.19",
+]
+
+[project.scripts]
+brain = "kitbrain.cli:main"
+doc-qa = "kitbrain.docqa:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kitbrain"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"template" = "kitbrain/template"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["model: needs the real embedding model files"]
+addopts = "-m 'not model'"

@@ -1,0 +1,1294 @@
+{
+  "version": 1,
+  "_comment": [
+    "Kit model registry source. port/regenerate.py (step 'registry') builds payload/shell/models.default.json from it:",
+    "harness adapters come from the live registry (only the ids in keepHarnesses, then harnessOverrides field by field, then addHarnesses);",
+    "providers and models come from this file only. Nothing of the build machine's own models ships.",
+    "Local models: the 15-local-llm catalog (kit/modules/15-local-llm/models.conf), served by kit-llm (llama.cpp) as provider kit-llm.",
+    "The endpoint is the provider's baseUrl; the environment variable in baseUrlEnv (KIT_LLM_BASE_URL) overrides it.",
+    "Cloud models: one or a few public ids per harness of 16-harness-clis. 'wb-state models discover' imports what the installed CLIs,",
+    "pi's ~/.pi/agent/models.json and kit-llm's catalog actually offer."
+  ],
+  "providers": [
+    {
+      "id": "claude-subscription",
+      "label": "Claude Code (sign-in)",
+      "kind": "subscription",
+      "notes": "No API key: Claude Code signs in itself."
+    },
+    {
+      "id": "chatgpt",
+      "label": "OpenAI Codex (ChatGPT sign-in)",
+      "kind": "subscription",
+      "apiKeyEnv": null,
+      "keychainService": null
+    },
+    {
+      "id": "google-gemini",
+      "label": "Gemini CLI (Google sign-in)",
+      "kind": "subscription",
+      "apiKeyEnv": null,
+      "keychainService": null
+    },
+    {
+      "id": "github-copilot",
+      "label": "GitHub Copilot (GitHub sign-in)",
+      "kind": "subscription",
+      "apiKeyEnv": null,
+      "keychainService": null
+    },
+    {
+      "id": "opencode-zen",
+      "label": "opencode (its own sign-in)",
+      "kind": "subscription",
+      "apiKeyEnv": null,
+      "keychainService": null
+    },
+    {
+      "id": "kit-llm",
+      "label": "kit-llm (llama.cpp, local)",
+      "kind": "local",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "baseUrlEnv": "KIT_LLM_BASE_URL",
+      "defaultRunner": "pi",
+      "discover": {
+        "source": "kit-llm",
+        "runners": [
+          "pi",
+          "aider"
+        ],
+        "supportsEffort": true,
+        "refTemplateByRunner": {
+          "aider": "openai/{name}"
+        },
+        "notes": "The catalog of 15-local-llm: 'kit-llm models', else models.conf of the installed kit."
+      },
+      "notes": "OpenAI-compatible endpoint of 15-local-llm ('kit-llm start <model>'). KIT_LLM_BASE_URL overrides baseUrl, e.g. for a server on another host."
+    },
+    {
+      "id": "ollama",
+      "label": "Ollama (local)",
+      "kind": "local",
+      "baseUrl": "http://127.0.0.1:11434",
+      "notes": "Only when Ollama is installed; no Ollama model ships."
+    }
+  ],
+  "harnesses": [
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "orchestratorDefaultModel": "opus",
+      "builtin": true,
+      "command": "~/.local/bin/claude",
+      "modelFamilyAliases": [
+        {
+          "aliases": [
+            "opus",
+            "claude-opus"
+          ],
+          "idPattern": "^claude-opus-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "sonnet",
+            "claude-sonnet"
+          ],
+          "idPattern": "^claude-sonnet-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "haiku",
+            "claude-haiku"
+          ],
+          "idPattern": "^claude-haiku-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        },
+        {
+          "aliases": [
+            "fable",
+            "claude-fable"
+          ],
+          "idPattern": "^claude-fable-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+        }
+      ],
+      "discover": {
+        "source": "binary-strings",
+        "pattern": "(?P<id>claude-(?P<family>opus|sonnet|haiku|fable)-(?P<version>[0-9]+(?:-[0-9]+)*)(?:\\[1m\\])?)",
+        "labelPattern": "{familyTitle} {versionDots} - ",
+        "variantLabelPattern": "{familyTitle} {versionDots} with 1M context",
+        "idPrefix": "",
+        "provider": "claude-subscription",
+        "contextWindowBySuffix": {
+          "[1m]": 1000000
+        },
+        "notes": "Reads the model list the installed CLI keeps itself."
+      },
+      "args": [
+        "--model",
+        "{model}"
+      ],
+      "cwdMode": "cd",
+      "effort": {
+        "style": "arg",
+        "args": [
+          "--effort",
+          "{effort}"
+        ],
+        "map": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max"
+        }
+      },
+      "systemPrompt": {
+        "style": "flag-content",
+        "flag": "--append-system-prompt",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--dangerously-skip-permissions"
+        ]
+      },
+      "resume": {
+        "args": [
+          "--resume",
+          "{resumeId}"
+        ],
+        "fallbackArgs": [
+          "--continue"
+        ],
+        "probe": "revive-only"
+      },
+      "modelSwitch": {
+        "command": "/model {model}",
+        "updateRequiredPattern": "(?i)update required|aktualisierung erforderlich",
+        "versionGate": true,
+        "notes": "Gemessen mit Claude Code: der Slash-Befehl wechselt in einer laufenden Sitzung; kennt die laufende Version das Modell noch nicht, meldet sie update required. Dann wird derselbe Pane ueber den vorhandenen Resume-Vertrag neu gestartet."
+      },
+      "readyPattern": "❯|░|●",
+      "promptPattern": "^❯",
+      "compactCommand": "/compact",
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": "~/.claude/projects/{cwdSlug}/{sessionId}.jsonl",
+        "format": "claude-transcript",
+        "maxAgeSec": null,
+        "zuordnung": "hook",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "arbeits-anzeige"
+        ],
+        "hook": {
+          "style": "claude-settings-json",
+          "file": "~/.claude/settings.json",
+          "event": "SessionStart",
+          "matcher": "startup|resume|clear|compact",
+          "timeout": 30
+        },
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [
+        "~/.claude/AGENTS.md",
+        "<project>/AGENTS.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": true,
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "notes": "Family aliases resolve to the newest enabled Claude model on every start. contextPattern stays null because context-guard measures Claude panes natively.",
+      "promptIgnore": "^❯ Press up to edit queued messages"
+    },
+    {
+      "id": "pi",
+      "label": "pi (local and custom providers)",
+      "builtin": true,
+      "command": "pi",
+      "modelSwitch": null,
+      "args": [
+        "--provider",
+        "{provider}",
+        "--model",
+        "{model}",
+        "--session-dir",
+        "{sessionDir}"
+      ],
+      "cwdMode": "cd",
+      "env": {},
+      "effort": {
+        "style": "arg",
+        "args": [
+          "--thinking",
+          "{effort}"
+        ],
+        "map": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max"
+        }
+      },
+      "systemPrompt": {
+        "style": "flag-path",
+        "flag": "--append-system-prompt",
+        "worker": "~/.pi/agent/WORKER.md",
+        "orchestrator": "~/.pi/agent/ORCHESTRATOR.md"
+      },
+      "autonomy": {
+        "args": []
+      },
+      "resume": {
+        "args": [
+          "--continue"
+        ],
+        "probe": "session-dir"
+      },
+      "sessionDir": "~/.pi-workers/sessions/{name}",
+      "readyPattern": "❯|░|●|[0-9.]+%/[0-9]+k",
+      "promptPattern": "^❯",
+      "compactCommand": null,
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": "~/.pi-workers/sessions/{name}/*.jsonl",
+        "format": "pi-jsonl",
+        "maxAgeSec": null,
+        "zuordnung": "cwd",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "arbeits-anzeige"
+        ],
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "effortInSpawnSpelling": false,
+      "instructionFiles": [
+        "~/.pi/agent/RULES.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": false,
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "notes": "pi-worker starts pi with --provider/--model directly; 'pi-worker <name> <provider>/<model> ...' accepts any pair from ~/.pi/agent/models.json. compactCommand null: pi does not compact on command, the guard asks for a handoff instead.",
+      "promptIgnore": "^❯ Press up to edit queued messages",
+      "discover": {
+        "source": "pi-models-json",
+        "file": "~/.pi/agent/models.json",
+        "supportsEffort": true,
+        "notes": "Imports every provider and model of pi's own ~/.pi/agent/models.json (ids pi-<provider>-<model>)."
+      }
+    },
+    {
+      "id": "codex",
+      "label": "OpenAI Codex CLI",
+      "orchestratorDefaultModel": "sol",
+      "command": "codex",
+      "modelSwitch": null,
+      "args": [
+        "--model",
+        "{model}",
+        "--search"
+      ],
+      "cwdMode": "cd",
+      "env": null,
+      "effort": {
+        "style": "arg",
+        "args": [
+          "-c",
+          "model_reasoning_effort={effort}"
+        ],
+        "map": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max",
+          "ultra": "ultra"
+        }
+      },
+      "systemPrompt": {
+        "style": "config-content",
+        "path": "~/.codex/AGENTS.md",
+        "key": "developer_instructions",
+        "flag": "-c",
+        "projectPath": "AGENTS.md",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--dangerously-bypass-approvals-and-sandbox"
+        ]
+      },
+      "resume": {
+        "args": [
+          "resume",
+          "--last"
+        ],
+        "probe": "session-dir"
+      },
+      "sessionDir": "~/.codex/sessions",
+      "readyPattern": "^› [^0-9]",
+      "trustStore": {
+        "style": "toml-section",
+        "file": "~/.codex/config.toml",
+        "table": "projects",
+        "key": "trust_level",
+        "value": "trusted",
+        "pathForm": "resolved",
+        "notes": "Gemessen 2026-08-08 mit codex-cli 0.146.0, umgelenktes HOME, eigener tmux-Socket: der Erststart in einem frischen Verzeichnis fragt 'Do you trust the contents of this directory?' und bietet '› 1. Yes, continue' an — auch mit --dangerously-bypass-approvals-and-sandbox. Das readyPattern trifft diese Zeile richtigerweise nicht, der Spawn scheitert also nach 60s sichtbar, statt den Auftrag zu verlieren. Beantwortet wird die Frage vorher durch den Abschnitt [projects.\"<pfad>\"] mit trust_level = \"trusted\" in dieser Datei; danach zeigt derselbe Start ohne Dialog die Eingabezeile. Der Pfad steht dort AUFGELOEST (pathForm resolved): gemessen mit einem Arbeitsverzeichnis unter /var/folders/... — codex nennt es selbst /private/var/folders/... und trifft den aufgeloesten Eintrag. Das ist der Unterschied zu agy, das sein logisches PWD fuehrt. Geschrieben wird ANGEHAENGT und nie mitten in der Datei, weil hier auch Einstellungen und der Migrationshinweis liegen."
+      },
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "compactCommand": "/compact",
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
+        "format": "codex-rollout",
+        "maxAgeSec": null,
+        "zuordnung": "cwd",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "arbeits-anzeige"
+        ],
+        "hook": {
+          "style": "codex-hooks-json",
+          "file": "~/.codex/hooks.json",
+          "trustFile": "~/.codex/config.toml",
+          "trustTable": "hooks.state"
+        },
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [
+        "~/.codex/AGENTS.md",
+        "<project>/AGENTS.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": true,
+      "notes": "Family aliases sol, terra, luna and astra resolve to the newest enabled model on every start. 'wb-state models discover codex' imports the models your account offers (~/.codex/models_cache.json).",
+      "promptPattern": "^›",
+      "discover": {
+        "source": "file-json",
+        "file": "~/.codex/models_cache.json",
+        "jsonPath": "models[].slug",
+        "filter": {
+          "field": "visibility",
+          "equals": "list"
+        },
+        "provider": "chatgpt",
+        "notes": "Reads the model list the installed CLI keeps itself."
+      },
+      "modelFamilyAliases": [
+        {
+          "aliases": [
+            "sol",
+            "gpt-sol"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:[.-][0-9]+)*)-sol$"
+        },
+        {
+          "aliases": [
+            "terra",
+            "gpt-terra"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:[.-][0-9]+)*)-terra$"
+        },
+        {
+          "aliases": [
+            "luna",
+            "gpt-luna"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:[.-][0-9]+)*)-luna$"
+        },
+        {
+          "aliases": [
+            "astra",
+            "gpt-astra"
+          ],
+          "idPattern": "^codex-gpt-(?P<version>[0-9]+(?:[.-][0-9]+)*)-astra$"
+        }
+      ]
+    },
+    {
+      "id": "aider",
+      "label": "Aider",
+      "command": "aider",
+      "modelSwitch": null,
+      "args": [
+        "--model",
+        "{model}"
+      ],
+      "cwdMode": "cd",
+      "env": {
+        "OPENAI_API_BASE": "{baseUrl:kit-llm}",
+        "OPENAI_API_KEY": "local-no-key",
+        "BROWSER": "/usr/bin/true"
+      },
+      "effort": {
+        "style": "arg",
+        "args": [
+          "--reasoning-effort",
+          "{effort}"
+        ],
+        "map": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
+      },
+      "systemPrompt": {
+        "style": "flag-path",
+        "flag": "--read",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--yes-always",
+          "--no-show-release-notes",
+          "--no-browser"
+        ]
+      },
+      "resume": {
+        "args": [
+          "--restore-chat-history"
+        ],
+        "probe": "revive-only"
+      },
+      "readyPattern": "^>",
+      "promptPattern": "^>",
+      "promptIgnore": null,
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "compactCommand": null,
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": ".aider.chat.history.md",
+        "format": "aider-chat-history",
+        "maxAgeSec": null,
+        "zuordnung": "cwd",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "arbeits-anzeige"
+        ],
+        "probe": {
+          "datum": "2026-08-08",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [],
+      "supportsPaste": true,
+      "altScreen": false,
+      "notes": "Local models via kit-llm: aider talks to its OpenAI-compatible endpoint (model 'openai/<id>', OPENAI_API_BASE from the kit-llm provider). An aider model of another provider needs its own key and a changed env."
+    },
+    {
+      "id": "opencode",
+      "label": "opencode",
+      "command": "opencode",
+      "modelSwitch": null,
+      "args": [
+        "--model",
+        "{model}"
+      ],
+      "cwdMode": "cd",
+      "effort": {
+        "style": "none",
+        "args": [],
+        "map": {}
+      },
+      "systemPrompt": {
+        "style": "file",
+        "path": "~/.config/opencode/AGENTS.md",
+        "projectPath": "AGENTS.md",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--auto"
+        ]
+      },
+      "resume": {
+        "args": [
+          "--continue"
+        ],
+        "probe": "revive-only"
+      },
+      "readyPattern": "ctrl\\+p commands",
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "compactCommand": "/compact",
+      "contextPattern": "[0-9.]+[KM][[:space:]]*\\(([0-9]{1,3})%\\)",
+      "session": {
+        "via": "http-sse",
+        "ort": "http://127.0.0.1:{chatPort}",
+        "format": "opencode-http",
+        "maxAgeSec": null,
+        "zuordnung": "serverId",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [],
+        "server": {
+          "bind": "127.0.0.1",
+          "token": "pflicht",
+          "auflage": "Der Server wird an 127.0.0.1 gebunden und bekommt ein Token (OPENCODE_SERVER_PASSWORD). Gemessen 2026-08-11: ohne Token meldet opencode beim Start selbst 'OPENCODE_SERVER_PASSWORD is not set; server is unsecured'. Ein offener lokaler Server ist eine Fernsteuerung fuer jeden Prozess auf der Maschine — die Auflage steht deshalb hier und nicht in einer Anmerkung."
+        },
+        "ablage": {
+          "ort": "~/.local/share/opencode/opencode.db",
+          "format": "opencode-sqlite",
+          "beleg": "gemessen 2026-08-11 (Bericht chatansicht): SQLite mit -wal/-shm, Tabellen session, message (role, time, agent, model.providerID/modelID), part (data-Spalte mit echtem Text, z. B. {\"type\":\"text\",\"text\":\"Lege eine Datei ergebnis.md an…\"}) und project_directory (6 Zeilen mit echten Arbeitsverzeichnissen dieser Maschine). Das ist der Notnagel, wenn kein Server laeuft, und der Grund, warum diese Datei ueberhaupt in der Registry steht; das LIVE-Schreiben wurde hier NICHT per Zeitabgleich belegt, weil das Lesen einer WAL-Datenbank die mtime selbst veraendern kann."
+        },
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [
+        "~/.config/opencode/AGENTS.md",
+        "<project>/AGENTS.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": true,
+      "notes": "Models come from 'wb-state models discover opencode'; no model ships by default.",
+      "discover": {
+        "source": "command-lines",
+        "command": [
+          "opencode",
+          "models"
+        ],
+        "provider": "opencode-zen",
+        "providerByPrefix": [
+          [
+            "kit-llm/",
+            "kit-llm"
+          ],
+          [
+            "ollama/",
+            "ollama"
+          ]
+        ],
+        "notes": "'opencode models' lists provider-prefixed references. A kit-llm provider configured in opencode's own config shows up as kit-llm/<id>."
+      }
+    },
+    {
+      "id": "copilot",
+      "label": "GitHub Copilot CLI (local model via kit-llm)",
+      "command": "copilot",
+      "modelSwitch": null,
+      "args": [],
+      "cwdMode": "cd",
+      "env": {
+        "COPILOT_PROVIDER_BASE_URL": "{baseUrl:kit-llm}",
+        "COPILOT_PROVIDER_TYPE": "openai",
+        "COPILOT_PROVIDER_API_KEY": "local-no-key",
+        "COPILOT_MODEL": "{model}",
+        "COPILOT_OFFLINE": "true",
+        "COPILOT_AUTO_UPDATE": "false",
+        "COPILOT_SETUP_TERMINAL": "false",
+        "BROWSER": "/usr/bin/true"
+      },
+      "effort": {
+        "style": "none",
+        "args": [],
+        "map": {}
+      },
+      "systemPrompt": {
+        "style": "file",
+        "projectPath": "AGENTS.md",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--allow-all"
+        ]
+      },
+      "resume": {
+        "args": [
+          "--continue"
+        ],
+        "probe": "revive-only"
+      },
+      "trustStore": {
+        "style": "json-array",
+        "file": "~/.copilot/config.json",
+        "key": "trustedFolders",
+        "pathForm": "logical",
+        "jsonc": true
+      },
+      "readyPattern": "^┃",
+      "promptPattern": "^┃",
+      "promptIgnore": null,
+      "compactCommand": "/compact",
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": "~/.copilot/session-store.db",
+        "format": "copilot-sqlite",
+        "maxAgeSec": null,
+        "zuordnung": "cwd",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "arbeits-anzeige"
+        ],
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [
+        "<project>/AGENTS.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": true,
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "notes": "Copilot CLI with its own OpenAI-compatible provider (kit-llm): no GitHub sign-in, no network."
+    },
+    {
+      "id": "copilot-cloud",
+      "label": "GitHub Copilot CLI (GitHub sign-in)",
+      "command": "copilot",
+      "args": [],
+      "cwdMode": "cd",
+      "env": {
+        "COPILOT_MODEL": "{model}",
+        "COPILOT_AUTO_UPDATE": "false",
+        "COPILOT_SETUP_TERMINAL": "false",
+        "BROWSER": "/usr/bin/true"
+      },
+      "effort": {
+        "style": "none",
+        "args": [],
+        "map": {}
+      },
+      "systemPrompt": {
+        "style": "file",
+        "projectPath": "AGENTS.md",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--allow-all"
+        ]
+      },
+      "resume": {
+        "args": [
+          "--continue"
+        ],
+        "probe": "revive-only"
+      },
+      "trustStore": {
+        "style": "json-array",
+        "file": "~/.copilot/config.json",
+        "key": "trustedFolders",
+        "pathForm": "logical",
+        "jsonc": true
+      },
+      "readyPattern": "^┃",
+      "promptPattern": "^┃",
+      "promptIgnore": null,
+      "compactCommand": "/compact",
+      "contextPattern": null,
+      "session": {
+        "via": "sessionFile",
+        "ort": "~/.copilot/session-store.db",
+        "format": "copilot-sqlite",
+        "maxAgeSec": null,
+        "zuordnung": "cwd",
+        "live": true,
+        "eingabe": "pane",
+        "zeigtNicht": [
+          "freigabedialog",
+          "kontextauslastung",
+          "arbeits-anzeige"
+        ],
+        "probe": {
+          "datum": "2026-08-11",
+          "beleg": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>."
+        }
+      },
+      "instructionFiles": [
+        "<project>/AGENTS.md"
+      ],
+      "supportsPaste": true,
+      "altScreen": true,
+      "probe": "Measured upstream on macOS. If a spawn on this machine does not see the input line, re-measure with: wb-harness-probe <harness>.",
+      "notes": "Sign in with 'copilot login'. Model 'auto' lets GitHub pick among the models your plan allows."
+    },
+    {
+      "id": "gemini",
+      "label": "Gemini CLI",
+      "command": "gemini",
+      "args": [
+        "--model",
+        "{model}"
+      ],
+      "cwdMode": "cd",
+      "env": {},
+      "effort": {
+        "style": "none",
+        "args": [],
+        "map": {}
+      },
+      "systemPrompt": {
+        "style": "file",
+        "projectPath": "GEMINI.md",
+        "worker": "~/.claude/roles/agent.md",
+        "orchestrator": "~/.claude/roles/orchestrator.md"
+      },
+      "autonomy": {
+        "args": [
+          "--yolo"
+        ]
+      },
+      "resume": null,
+      "readyPattern": null,
+      "promptPattern": null,
+      "promptIgnore": null,
+      "compactCommand": "/compress",
+      "contextPattern": null,
+      "session": {
+        "via": "",
+        "grund": "Not measured yet: the kit adds the Gemini CLI adapter without a measured session source; the context guard reads nothing for gemini panes until one is measured.",
+        "live": false,
+        "eingabe": "pane",
+        "zeigtNicht": [],
+        "probe": {
+          "datum": "2026-09-25",
+          "beleg": "Kit adapter, not measured. Measure with: wb-harness-probe gemini."
+        }
+      },
+      "supportsPaste": true,
+      "notes": "Not measured yet: readyPattern is empty, so a spawn refuses until 'wb-harness-probe gemini' has measured the input line on this machine (after 'gemini' sign-in)."
+    }
+  ],
+  "models": [
+    {
+      "id": "qwen3.5-4b",
+      "label": "Qwen3.5 4B (kit-llm)",
+      "harness": "pi",
+      "provider": "kit-llm",
+      "modelRef": "qwen3.5-4b",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.7,
+      "goodFor": "Default local worker: short, well-specified tasks on data that must stay on the laptop.",
+      "notFor": "Long multi-step work, large codebases, anything needing a large context.",
+      "workerClass": [
+        {
+          "class": "mechanisch",
+          "effort": "low"
+        },
+        {
+          "class": "bulk",
+          "effort": "low"
+        }
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "supportsEffort": true,
+      "defaultEffort": "low"
+    },
+    {
+      "id": "aider-qwen3.5-4b",
+      "label": "Qwen3.5 4B (kit-llm) via aider",
+      "harness": "aider",
+      "provider": "kit-llm",
+      "modelRef": "openai/qwen3.5-4b",
+      "roles": [
+        "worker"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.7,
+      "goodFor": "Default local worker: short, well-specified tasks on data that must stay on the laptop.",
+      "notFor": "Long multi-step work, large codebases, anything needing a large context.",
+      "supportsEffort": false
+    },
+    {
+      "id": "granite-4.0-micro",
+      "label": "Granite 4.0 Micro (kit-llm)",
+      "harness": "pi",
+      "provider": "kit-llm",
+      "modelRef": "granite-4.0-micro",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.1,
+      "goodFor": "Extraction, classification and summaries that must stay local.",
+      "notFor": "Multi-file code changes.",
+      "workerClass": [
+        {
+          "class": "bulk",
+          "effort": "low"
+        }
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "supportsEffort": true,
+      "defaultEffort": "low"
+    },
+    {
+      "id": "aider-granite-4.0-micro",
+      "label": "Granite 4.0 Micro (kit-llm) via aider",
+      "harness": "aider",
+      "provider": "kit-llm",
+      "modelRef": "openai/granite-4.0-micro",
+      "roles": [
+        "worker"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.1,
+      "goodFor": "Extraction, classification and summaries that must stay local.",
+      "notFor": "Multi-file code changes.",
+      "supportsEffort": false
+    },
+    {
+      "id": "qwen3.5-2b",
+      "label": "Qwen3.5 2B (kit-llm)",
+      "harness": "pi",
+      "provider": "kit-llm",
+      "modelRef": "qwen3.5-2b",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 1.3,
+      "goodFor": "Very small local tasks on machines with little free RAM.",
+      "notFor": "Anything needing reasoning over several steps.",
+      "workerClass": [
+        {
+          "class": "bulk",
+          "effort": "low"
+        }
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "supportsEffort": true,
+      "defaultEffort": "low"
+    },
+    {
+      "id": "aider-qwen3.5-2b",
+      "label": "Qwen3.5 2B (kit-llm) via aider",
+      "harness": "aider",
+      "provider": "kit-llm",
+      "modelRef": "openai/qwen3.5-2b",
+      "roles": [
+        "worker"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 1.3,
+      "goodFor": "Very small local tasks on machines with little free RAM.",
+      "notFor": "Anything needing reasoning over several steps.",
+      "supportsEffort": false
+    },
+    {
+      "id": "ministral-3-3b",
+      "label": "Ministral 3 3B (kit-llm)",
+      "harness": "pi",
+      "provider": "kit-llm",
+      "modelRef": "ministral-3-3b",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.1,
+      "goodFor": "Local comparison runs; optional model, installed only with 'kit-llm' --models.",
+      "notFor": "Default work.",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "supportsEffort": true,
+      "defaultEffort": "low"
+    },
+    {
+      "id": "aider-ministral-3-3b",
+      "label": "Ministral 3 3B (kit-llm) via aider",
+      "harness": "aider",
+      "provider": "kit-llm",
+      "modelRef": "openai/ministral-3-3b",
+      "roles": [
+        "worker"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.1,
+      "goodFor": "Local comparison runs; optional model, installed only with 'kit-llm' --models.",
+      "notFor": "Default work.",
+      "supportsEffort": false
+    },
+    {
+      "id": "gemma-4-e2b",
+      "label": "Gemma 4 E2B (kit-llm)",
+      "harness": "pi",
+      "provider": "kit-llm",
+      "modelRef": "gemma-4-e2b",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.8,
+      "goodFor": "Local comparison runs; optional model, installed only with 'kit-llm' --models.",
+      "notFor": "Default work.",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "xhigh",
+      "supportsEffort": true,
+      "defaultEffort": "low"
+    },
+    {
+      "id": "aider-gemma-4-e2b",
+      "label": "Gemma 4 E2B (kit-llm) via aider",
+      "harness": "aider",
+      "provider": "kit-llm",
+      "modelRef": "openai/gemma-4-e2b",
+      "roles": [
+        "worker"
+      ],
+      "contextWindow": 16384,
+      "dataStaysLocal": true,
+      "enabled": true,
+      "gewichteGb": 2.8,
+      "goodFor": "Local comparison runs; optional model, installed only with 'kit-llm' --models.",
+      "notFor": "Default work.",
+      "supportsEffort": false
+    },
+    {
+      "id": "claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "alias": "opus55",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-opus-5-5",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "xhigh",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh"
+        },
+        {
+          "class": "review",
+          "effort": "high"
+        }
+      ],
+      "goodFor": "Long, multi-step work, debugging, design decisions, ambiguity.",
+      "notFor": "Mechanical edits."
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Claude Sonnet 5",
+      "alias": "sonnet5",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-sonnet-5",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "high",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "coding-kurz",
+          "effort": "high"
+        },
+        {
+          "class": "coding-lang",
+          "effort": "xhigh"
+        }
+      ],
+      "goodFor": "Short to medium, well-specified coding: cross-file refactors, test suites, documentation.",
+      "notFor": "Open design questions."
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "label": "Claude Haiku 4.5",
+      "alias": "haiku45",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-haiku-4-5",
+      "roles": [
+        "worker"
+      ],
+      "maxEffort": "high",
+      "defaultEffort": "low",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "mechanisch",
+          "effort": "low"
+        }
+      ],
+      "goodFor": "Renames, config tweaks, formatting, one obvious fix.",
+      "notFor": "Anything over a few files."
+    },
+    {
+      "id": "claude-fable-5-1",
+      "label": "Claude Fable 5.1",
+      "harness": "claude",
+      "provider": "claude-subscription",
+      "modelRef": "claude-fable-5-1",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "maxEffort": "xhigh",
+      "defaultEffort": "high",
+      "enabled": true,
+      "goodFor": "Specialized Claude work when the task explicitly selects Fable.",
+      "notFor": "A default or fallback model."
+    },
+    {
+      "id": "codex-gpt-6-sol",
+      "label": "GPT-6 Sol (Codex)",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-sol",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "ultra",
+      "defaultEffort": "high",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "coding-lang",
+          "effort": "high"
+        }
+      ],
+      "goodFor": "Primary Codex coding and orchestration.",
+      "notFor": "Work the Codex plan of your account does not include; check with 'wb-state models discover codex'."
+    },
+    {
+      "id": "codex-gpt-5-6-terra",
+      "label": "GPT-5.6 Terra (Codex)",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-5.6-terra",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "ultra",
+      "defaultEffort": "high",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "reasoning",
+          "effort": "xhigh"
+        }
+      ],
+      "goodFor": "Deep reasoning and debugging in Codex.",
+      "notFor": "Mechanical edits."
+    },
+    {
+      "id": "codex-gpt-6-luna",
+      "label": "GPT-6 Luna (Codex)",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-luna",
+      "roles": [
+        "worker"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "maxEffort": "max",
+      "defaultEffort": "medium",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "mechanisch",
+          "effort": "medium"
+        }
+      ],
+      "goodFor": "Fast, well-specified worker tasks.",
+      "notFor": "Open design decisions."
+    },
+    {
+      "id": "codex-gpt-6-astra",
+      "label": "GPT-6 Astra (Codex)",
+      "harness": "codex",
+      "provider": "chatgpt",
+      "modelRef": "gpt-6-astra",
+      "roles": [
+        "worker",
+        "orchestrator"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "maxEffort": "ultra",
+      "defaultEffort": "high",
+      "enabled": true,
+      "workerClass": [
+        {
+          "class": "zweitmeinung",
+          "effort": "high"
+        },
+        {
+          "class": "review",
+          "effort": "high"
+        }
+      ],
+      "goodFor": "Independent reviews and second opinions.",
+      "notFor": "Mechanical edits."
+    },
+    {
+      "id": "gemini-2-5-pro",
+      "label": "Gemini 2.5 Pro (Gemini CLI)",
+      "harness": "gemini",
+      "provider": "google-gemini",
+      "modelRef": "gemini-2.5-pro",
+      "roles": [
+        "worker"
+      ],
+      "supportsEffort": false,
+      "enabled": true,
+      "workerClass": [
+        "zweitmeinung"
+      ],
+      "goodFor": "Second opinion from another model family; long documents.",
+      "notFor": "Use before the gemini harness is measured (see its notes)."
+    },
+    {
+      "id": "gemini-2-5-flash",
+      "label": "Gemini 2.5 Flash (Gemini CLI)",
+      "harness": "gemini",
+      "provider": "google-gemini",
+      "modelRef": "gemini-2.5-flash",
+      "roles": [
+        "worker"
+      ],
+      "supportsEffort": false,
+      "enabled": true,
+      "workerClass": [
+        "recherche"
+      ],
+      "goodFor": "Fast, cheap bulk reading and sorting.",
+      "notFor": "Use before the gemini harness is measured (see its notes)."
+    },
+    {
+      "id": "copilot-cloud-auto",
+      "label": "GitHub Copilot (auto)",
+      "harness": "copilot-cloud",
+      "provider": "github-copilot",
+      "modelRef": "auto",
+      "roles": [
+        "worker"
+      ],
+      "supportsEffort": false,
+      "enabled": true,
+      "workerClass": [
+        "coding-lang"
+      ],
+      "goodFor": "Coding tasks through the company's GitHub Copilot plan; GitHub picks the model per turn.",
+      "notFor": "Work that needs a fixed model."
+    }
+  ]
+}

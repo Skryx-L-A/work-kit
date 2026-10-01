@@ -1,0 +1,397 @@
+#!/bin/bash
+# wb-testsuite-run -- Wrapper um shell/tests/run-all.sh fuer den woechentlichen
+# launchd-Job (agent-workbench.wb-testsuite).
+#
+# Anlass (2026-08-04): der Job lief seit Wochen still vor sich hin. Der Bericht
+# landete in ~/.local/state/wb-testsuite-report.md, aber niemand liest diese
+# Datei ungefragt -- ein rotes Ergebnis waere bis zum naechsten Sonntag (oder
+# laenger) unbemerkt geblieben. Selbe Lehre wie bei Gardener/Kbase-Backup/
+# brain-extra-embed/claude-md-lint: "Ein Werkzeug ohne Aufrufer ist kein
+# Werkzeug." Dieser Wrapper macht das letzte Ergebnis fuer den SessionStart-
+# Hook maschinenlesbar, damit die naechste Session es von selbst sieht.
+#
+# run-all.sh selbst bleibt unangetastet -- daran arbeitet gerade jemand
+# anders. Der Wrapper ruft es nur auf und liest sein Textprotokoll aus, das
+# ohnehin schon PASS/FAIL/SKIP-Zahlen und eine Tabelle ausgibt.
+#
+# NICHT INSTALLIERT: laeuft ueber den launchd-Job (siehe
+# shell/agent-workbench.wb-testsuite.plist) direkt aus dem REPO-Pfad, nicht aus
+# einer Kopie unter ~/.local/bin -- die Begruendung steht im Kopf des Plists:
+# run-all.sh sammelt seine Suiten relativ zu seinem eigenen Verzeichnis
+# (Geschwister-Dateien test-*.sh) und ruft zusaetzlich npm run check im
+# Nachbarordner extension/ auf; eine isolierte Kopie haette diese Geschwister
+# nicht und liefe leer oder falsch.
+#
+# Format-Entscheidung fuer die Statusdatei: einfache key=value-Zeilen statt
+# JSON. Der SessionStart-Hook braucht dafuer kein jq (schneller, eine
+# Abhaengigkeit weniger auf dem kritischen Pfad, der bei JEDER Session laeuft)
+# und die Datei ist mit `grep`/`cut` robust und schnell lesbar, auch wenn sie
+# mal leer oder halb geschrieben ist.
+#
+# Ort: ~/.local/state/ -- selbes Verzeichnis wie der bestehende Report, kein
+# neuer Ordner noetig, launchd-Jobs schreiben dort ohnehin schon hin.
+#
+# Parsing-Grenze (bewusst dokumentiert): die Liste der roten Suiten wird aus
+# der von run-all.sh gedruckten Tabelle herausgelesen, per Zeilen-Praefix
+# ("shell/tests/", "shell/wb-consistency", "hooks/tests/", "extension/") plus
+# dem Status-Wort (PASS/FAIL/SKIP) als Anker -- NICHT ueber feste
+# Spaltenbreiten, weil manche Suite-Namen laenger sind als die von run-all.sh
+# vorgesehene Breite und die Tabelle dann verrutscht (beobachtet:
+# "test-context-guard-fertigmeldung.sh").
+# Falls run-all.sh sein Ausgabeformat grundlegend aendert, greift die
+# Gegenprobe unten (parse_ok) und die Statusdatei faellt auf die sicheren
+# Summen-Zahlen zurueck statt falsche Namen zu behaupten.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Der Nachbar `tests/run-all.sh` steht NUR im Repo neben diesem Skript, nicht neben
+# der installierten Kopie (~/.local/bin/wb-testsuite-run). Ueber den PATH aufgerufen
+# lief das Skript deshalb in ein `exit 127` und schrieb eine Statusdatei mit
+# parse_ok=0 -- die Ampel bekam einen Fehlschlag gemeldet, der keiner war (gemessen
+# 22.08.). Der launchd-Job trifft es nicht, er ruft den Repo-Pfad; ein Mensch oder
+# Agent, der den Befehl einfach tippt, schon. Dieselbe Loesung wie in wb-hygiene:
+# eine feste Repo-Wurzel als Rueckfallebene, ueberschreibbar fuer Tests.
+RUN_ALL="$SCRIPT_DIR/tests/run-all.sh"
+if [ ! -x "$RUN_ALL" ]; then
+  RUN_ALL="${WB_REPO_SHELL:-$HOME/AI/claude-workbench/shell}/tests/run-all.sh"
+fi
+if [ ! -x "$RUN_ALL" ]; then
+  echo "wb-testsuite-run: run-all.sh nicht gefunden (weder neben dem Skript noch unter" >&2
+  echo "  ${WB_REPO_SHELL:-$HOME/AI/claude-workbench/shell}/tests/). WB_REPO_SHELL setzen." >&2
+  exit 2
+fi
+STATE_DIR="$HOME/.local/state"
+REPORT_FILE="$STATE_DIR/wb-testsuite-report.md"
+STATUS_FILE="$STATE_DIR/wb-testsuite-status.txt"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+# --- GPU-Waechter: nicht dazwischendraengen, sondern selbst verschieben ----
+# Anlass (16.08.2026, gemessen in der Nachbarsitzung, siehe Kopfkommentar von
+# shell/wb-belegung Abschnitt "NACHTRAG (16.08.)"): der Job feuert sonntags
+# 20:00 fest nach der Uhr und fragt nicht, ob die Karte gerade jemand anderem
+# gehoert. Am 16.08. lief zeitgleich ein Traum-Lauf, die Testsuite hat
+# `lmalpha:9b` dazu auf die Karte gelegt, und die Extraktion des Traum-Laufs
+# fiel von 75 auf 225 Sekunden je Buendel. Entscheidung des Nutzers: die Suite
+# sieht VOR dem Start nach, ob die GPU belegt ist, und verschiebt sich dann
+# SELBST, statt sich dazwischenzudraengen.
+#
+# NUR DER GANZE LAUF WIRD VERSCHOBEN, nicht einzelne Suiten -- gemessen statt
+# vermutet (Auftrag Punkt 1): unter shell/tests/test-*.sh ist genau EINE
+# Suite als echte Modell-Ladung dokumentiert und bereits dafuer gegatet --
+# test-contradiction-queue.sh, deren eigener Kopfkommentar einen echten
+# Judge-Aufruf (lokales Modell, ~1-2 Min) ausdruecklich einraeumt, und deren
+# skip_reason_for() in run-all.sh schon prueft, ob ein Ollama-Server ueberhaupt
+# erreichbar ist. Alle anderen Fundstellen von "ollama"/"lmalpha"/"mlx" in
+# shell/tests/ liefen bei Durchsicht gegen einen SHIM oder eine fake-ollama.py-
+# Fixture, nicht gegen einen echten Server. Bei nur einer betroffenen Suite
+# waere die feinere Loesung (nur sie verschieben) technisch die Wahl aus dem
+# Auftrag -- sie braucht aber eine Aenderung an run-all.sh selbst, und dessen
+# eigener Kopfkommentar sagt ausdruecklich "daran arbeitet gerade jemand
+# anders"; `git worktree list` zeigt zum Zeitpunkt dieser Aenderung tatsaechlich
+# zwei weitere aktive Arbeitsbaeume (wb/konsistenz, wb/regelraum). Ein Eingriff
+# in eine Datei, die laut eigenem Kommentar und sichtbar aktiver Nebenarbeit
+# gerade in Arbeit ist, waere das groessere Risiko als ein verschobener
+# Gesamtlauf einmal die Woche. Der Waechter sitzt deshalb hier im Wrapper, vor
+# dem unveraenderten Aufruf von run-all.sh.
+#
+# WAS ALS "BELEGT" ZAEHLT -- zwei bestehende Werkzeuge statt einer dritten
+# Zaehlweise (Auftrag Punkt 2, bekannte Falle: `pgrep -f` auf einen
+# Modellnamen trifft auch den ROLLEN-PROMPT laufender Agenten, weil deren Name
+# darin steht -- am 03.08. und am 17.08. zweimal passiert). `wb-belegung wer
+# --json` kennt die richtige Antwort bereits und benutzt dafuer weder pgrep
+# noch eine eigene Prozessliste, sondern `check-resources` (ollama ps + der
+# Groessen-Endpunkt /api/ps, gefiltert nach "laeuft der Port wirklich lokal"):
+#   * jede REGISTRIERTE Belegung im Buch (.belegungen) -- das ist der Weg, auf
+#     dem ein lokaler Modellserver wie lmbeta-server sich VOR dem Start meldet
+#     (siehe dessen eigener Kopfkommentar "BELEGUNGSBUCH").
+#   * eine STABILE Ollama-Ladung (.ollama_status == "ladungen") -- aber erst
+#     OBERHALB einer Groessenschwelle, siehe naechster Absatz.
+#   * .ollama_status == "unbekannt" (Server antwortet, Groessen nicht lesbar)
+#     zaehlt als belegt -- "unbekannt ist nicht frei" ist an dieser Stelle im
+#     ganzen Haus dieselbe Regel, siehe check-resources und wb-belegung.
+#   * .ollama_status == "fremd" (Port 11434 wird von einer ANDEREN Maschine
+#     bedient, siehe check-resources' ollama_listener) zaehlt NICHT: die
+#     GPU dieser Maschine ist davon nicht betroffen.
+#
+# GROESSENSCHWELLE 2 GiB, NICHT JEDE OLLAMA-LADUNG: eine Live-Messung waehrend
+# dieser Aenderung zeigte `embeddinggemma:latest` mit 0,626 GiB dauerhaft
+# geladen (der Embedder fuer `brain search`) -- ein Waechter, der JEDE Ladung
+# als belegt zaehlt, haette den Job JEDE Woche fuer immer verschoben, denn
+# dieser kleine Embedder ist praktisch staendig im Speicher. Dieselbe Trennung
+# steht schon in check-resources' eigenem Kommentar: "q8_0-Embedder wiegen
+# unter 1 GiB, ein 35B-Coder ueber 20". Der Vorfall selbst nennt `lmalpha:9b`
+# mit rund 6,4 GB. 2 GiB liegt mit Abstand zu beiden Seiten zwischen den
+# gemessenen Embeddern und jedem im Haus gemessenen Coder/Chat-Modell.
+#
+# OBERGRENZE UND ENDE (Auftrag Punkt 3): 6 Wiederholungen im Abstand von
+# 600 s (10 min), macht bis zu 3600 s (60 min) Gesamtwartezeit -- dieselbe
+# Zahl, die `gpu-slot warte` (shell/gpu-slot) schon als eigene Vorgabe fuer
+# "auf einen Platz warten" traegt, hier wiederverwendet statt neu erfunden.
+# Der Abstand liegt in derselben Groessenordnung wie eine einzelne
+# Erzeugungsstufe (bis 900 s, siehe run-all.sh) -- kurz genug, um eine
+# voruebergehende Belegung noch in derselben Nacht zu erwischen, lang genug,
+# um nicht im Sekundentakt gegen `check-resources` zu klopfen. Nach der letzten
+# erfolglosen Pruefung gibt der Lauf SICHTBAR auf: eine Protokollzeile hier,
+# Exit-Code 75 (EX_TEMPFAIL aus sysexits.h -- "voruebergehend gescheitert,
+# spaeter erneut versuchen"; kollidiert mit keinem der bestehenden Codes 0/1/2
+# dieses Wrappers bzw. von run-all.sh), und ein `fail=1`-Eintrag in der
+# Statusdatei, den der bestehende SessionStart-Hook
+# (~/.claude/hooks/sessionstart-testsuite-status.sh) schon OHNE eigene
+# Aenderung anzeigt -- er unterscheidet nur `fail == 0` von `fail > 0` und
+# druckt dazu den Namen aus `failed_suites`. Der Hook selbst ist ein
+# installiertes Artefakt ausserhalb dieses Arbeitsbaums und wird hier nicht
+# angefasst (dieselbe Zurueckhaltung wie bei der plist).
+# Als Umgebungsvariablen ueberschreibbar -- derselbe Testhaken wie
+# RUN_ALL_LOCK_SELFTEST in run-all.sh: ohne ihn muesste jeder Test auf die
+# volle Stunde Wartezeit warten, nur um die paar Zeilen rund um gpu_warten zu
+# treffen. Unter Standardbedingungen bleiben die Vorgaben unveraendert.
+: "${GPU_BELEGT_SCHWELLE_GIB:=2.0}"
+: "${GPU_MAX_WARTE_S:=3600}"
+: "${GPU_ABSTAND_S:=600}"
+GPU_GRUND_LETZT=""
+
+belegung_bin() {
+  local p="$HOME/.local/bin/wb-belegung"
+  if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
+  command -v wb-belegung 2>/dev/null
+}
+
+# Wie in run-all.sh: 'timeout' fehlt auf manchen Mac-PATHs (kein coreutils),
+# dann ohne Zeitlimit rufen statt mit "timeout: command not found" zu
+# scheitern und jeden Lauf faelschlich fuer belegt zu halten.
+GPU_TIMEOUT_BIN=""
+command -v timeout >/dev/null 2>&1 && GPU_TIMEOUT_BIN="timeout"
+
+# rc 0 = belegt (Grund auf stdout), rc 1 = frei.
+gpu_belegt_grund() {
+  local bin json n_belegungen ollama_status schwer
+  bin="$(belegung_bin)"
+  if [ -z "$bin" ]; then
+    echo "wb-belegung nicht gefunden -- nicht messbar, gilt vorsichtshalber als belegt"
+    return 0
+  fi
+  if [ -n "$GPU_TIMEOUT_BIN" ]; then
+    json="$("$GPU_TIMEOUT_BIN" 20 "$bin" wer --json 2>/dev/null)"
+  else
+    json="$("$bin" wer --json 2>/dev/null)"
+  fi
+  if [ -z "$json" ] || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    echo "wb-belegung wer --json lieferte keine lesbare Antwort -- nicht messbar, gilt vorsichtshalber als belegt"
+    return 0
+  fi
+  n_belegungen="$(printf '%s' "$json" | jq -r '(.belegungen // []) | length')"
+  if [ "${n_belegungen:-0}" != "0" ]; then
+    printf '%s registrierte Belegung(en) im Buch (wb-belegung wer): %s\n' "$n_belegungen" \
+      "$(printf '%s' "$json" | jq -r '[.belegungen[].zweck] | join(", ")')"
+    return 0
+  fi
+  ollama_status="$(printf '%s' "$json" | jq -r '.ollama_status // "unbekannt"')"
+  case "$ollama_status" in
+    unbekannt)
+      echo "Ollama-Status UNBEKANNT (Server antwortet, Groessen nicht lesbar) -- gilt vorsichtshalber als belegt"
+      return 0
+      ;;
+    ladungen)
+      schwer="$(printf '%s' "$json" | jq -r --argjson schwelle "$GPU_BELEGT_SCHWELLE_GIB" \
+        '[.ollama_ladungen[] | select(.stabil == true and .gb > $schwelle)] | length')"
+      if [ "${schwer:-0}" != "0" ]; then
+        printf 'ollama haelt %s Modell(e) ueber %s GiB geladen: %s\n' "$schwer" "$GPU_BELEGT_SCHWELLE_GIB" \
+          "$(printf '%s' "$json" | jq -r --argjson schwelle "$GPU_BELEGT_SCHWELLE_GIB" \
+             '[.ollama_ladungen[] | select(.stabil == true and .gb > $schwelle) | "\(.name) (\(.gb) GiB)"] | join(", ")')"
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# rc 0 = frei, Lauf darf starten. rc 1 = nach GPU_MAX_WARTE_S immer noch
+# belegt, GPU_GRUND_LETZT traegt den letzten Grund.
+gpu_warten() {
+  local start=$SECONDS versuch=0 grund vergangen
+  while :; do
+    versuch=$((versuch + 1))
+    if grund="$(gpu_belegt_grund)"; then
+      vergangen=$((SECONDS - start))
+      GPU_GRUND_LETZT="$grund"
+      if [ "$vergangen" -ge "$GPU_MAX_WARTE_S" ]; then
+        echo "GPU-Waechter: nach $versuch Versuchen und ${vergangen}s aufgegeben -- $grund"
+        return 1
+      fi
+      echo "GPU-Waechter: belegt ($grund) -- Versuch $versuch, warte ${GPU_ABSTAND_S}s und pruefe erneut."
+      sleep "$GPU_ABSTAND_S"
+      continue
+    fi
+    [ "$versuch" -gt 1 ] && echo "GPU-Waechter: frei nach $((SECONDS - start))s (Versuch $versuch) -- Lauf startet."
+    return 0
+  done
+}
+
+if ! gpu_warten; then
+  ts_epoch=$(date +%s)
+  ts_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  meldung="Der Testlauf wurde nicht gestartet: die GPU war ueber ${GPU_MAX_WARTE_S}s (Wiederholungen alle ${GPU_ABSTAND_S}s) hinweg belegt. Letzter Grund: ${GPU_GRUND_LETZT}. Der naechste planmaessige Lauf versucht es erneut."
+  printf '%s\n' "$meldung" > "$REPORT_FILE.tmp" && mv "$REPORT_FILE.tmp" "$REPORT_FILE"
+  {
+    echo "# wb-testsuite-status.txt -- von wb-testsuite-run geschrieben, siehe Kopfkommentar dort."
+    echo "ts_epoch=$ts_epoch"
+    echo "ts_iso=$ts_iso"
+    echo "parse_ok=1"
+    echo "exit_code=75"
+    echo "pass=0"
+    echo "fail=1"
+    echo "skip=0"
+    echo "total=1"
+    echo "failed_suites=VERSCHOBEN: GPU belegt (${GPU_GRUND_LETZT})"
+    echo "vollstaendig="
+  } > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+  exit 75
+fi
+
+# --- Der GEPRUEFTE STAND: welchen Commit dieser Lauf gesehen hat -----------
+# Anlass (21.08.2026): in der Leiste stand neben 'host2' eine rote Marke aus
+# einem Lauf vom 16.08. -- 54 rote Suiten, entstanden vor der Behebung des
+# Bildtakt-Fehlers auf Linux. Der Befund war wahr fuer den 16.08. und sagte
+# nichts ueber heute; die Farbe sagte das nicht, sie las sich als "jetzt
+# kaputt". Damit die Ampel (app/src/main/ampel.ts) einen ueberholten Befund
+# von einem frischen unterscheiden kann, braucht sie zwei Zahlen von DERSELBEN
+# Maschine: den Stand, den dieser Lauf geprueft hat, und den Stand des Repos
+# jetzt. Die erste Zahl kann nur hier entstehen, im Augenblick des Laufs.
+#
+# `repo_dir` steht mit in der Datei, damit die Ampel den Baum spaeter wieder
+# findet, ohne ihn zu raten -- auf host2 liegt er unter einem anderen Pfad als
+# hier, und die Ampel bewertet beide Maschinen mit derselben Regel.
+#
+# GEMESSEN VOR DEM LAUF, nicht danach: geprueft wird der Baum, wie er beim
+# Start dasteht. Nach einer Stunde GPU-Wartezeit und einem langen Lauf kann
+# HEAD schon weitergerueckt sein.
+#
+# Fehlt git oder liegt der Wrapper nicht in einem Arbeitsbaum, bleiben die drei
+# Felder LEER. Die Ampel faellt dann auf ihr bisheriges Verhalten zurueck (ein
+# roter Befund bleibt rot) -- nicht auf "alles gut".
+repo_dir=""
+repo_commit=""
+repo_commit_ts=""
+if command -v git >/dev/null 2>&1; then
+  repo_dir="$(git --no-optional-locks -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$repo_dir" ]; then
+    repo_commit="$(git --no-optional-locks -C "$repo_dir" rev-parse HEAD 2>/dev/null)"
+    repo_commit_ts="$(git --no-optional-locks -C "$repo_dir" log -1 --format=%ct 2>/dev/null)"
+    # Alles oder nichts: eine halbe Angabe (Commit ohne Zeitstempel) waere fuer
+    # den Vergleich unbrauchbar und wuerde nur so aussehen, als gaebe es sie.
+    if [ -z "$repo_commit" ] || [ -z "$repo_commit_ts" ]; then
+      repo_dir=""; repo_commit=""; repo_commit_ts=""
+    fi
+  fi
+fi
+
+# EIN AUSDRUECKLICHER WERT, kein Erben der Vorgabe (2026-08-22). Seit der Deckel von acht
+# in run-all.sh weg ist, nimmt ein Aufruf ohne Angabe die Kernzahl -- hier 18. Gemessen am
+# selben Tag: bei 14 gleichzeitigen Suiten faellt eine, bei 24 fallen neun, und alle sind
+# einzeln gruen. Es ist also nicht die Maschine (Last 2,7, 34 GiB frei bei 24), sondern die
+# Isolation der Suiten untereinander. Dieser Lauf schreibt die Statusdatei, aus der die
+# Ampel ihre Farbe nimmt -- er darf am wenigsten von allen Laeufen Rauschen liefern, und
+# deshalb steht hier der gemessene Arbeitspunkt und nicht das, was gerade voreingestellt ist.
+# Ueberschreibbar fuer den, der es besser weiss.
+JOBS_HIER="${WB_TESTSUITE_JOBS:-14}"
+output="$("$RUN_ALL" --jobs "$JOBS_HIER" 2>&1)"
+exit_code=$?
+
+# Menschlicher Bericht bleibt wie bisher -- selber Ort, selber Inhalt, nur
+# jetzt vom Wrapper statt von launchds StandardOutPath geschrieben.
+printf '%s\n' "$output" > "$REPORT_FILE.tmp" && mv "$REPORT_FILE.tmp" "$REPORT_FILE"
+
+ts_epoch=$(date +%s)
+ts_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+summary_line=$(printf '%s\n' "$output" | grep -E '^PASS: [0-9]+  FAIL: [0-9]+  SKIP: [0-9]+' | tail -1)
+pass=$(printf '%s' "$summary_line" | grep -oE 'PASS: [0-9]+' | grep -oE '[0-9]+')
+fail=$(printf '%s' "$summary_line" | grep -oE 'FAIL: [0-9]+' | grep -oE '[0-9]+')
+skip=$(printf '%s' "$summary_line" | grep -oE 'SKIP: [0-9]+' | grep -oE '[0-9]+')
+total=$(printf '%s' "$summary_line" | grep -oE 'gesamt [0-9]+' | grep -oE '[0-9]+')
+
+# vollstaendig: seit 2026-08-19 druckt run-all.sh eine eigene Zeile
+# "VOLLSTAENDIG: ja|nein", sobald --nur/--schnell/--geaendert eine Teilmenge
+# ausgewaehlt hat (siehe dessen Kopfkommentar). Dieser Wrapper ruft run-all.sh
+# selbst nie mit einer dieser Optionen auf, darum hier normalerweise "ja" --
+# das Feld existiert fuer einen KUENFTIGEN Push-Weg, der run-all.sh direkt
+# aufruft und diese Statusdatei statt eines Versprechens prueft.
+vollstaendig=$(printf '%s\n' "$output" | grep -oE '^VOLLSTAENDIG: (ja|nein)' | tail -1 | awk '{print ($2=="ja")?1:0}')
+
+# Fallback: Summenzeile nicht gefunden oder nicht parsbar -> keine Zahlen
+# erfinden, sondern ehrlich als unparsbar markieren.
+if ! [[ "$fail" =~ ^[0-9]+$ ]]; then
+  {
+    echo "# wb-testsuite-status.txt -- von wb-testsuite-run geschrieben, siehe Kopfkommentar dort."
+    echo "ts_epoch=$ts_epoch"
+    echo "ts_iso=$ts_iso"
+    echo "parse_ok=0"
+    echo "exit_code=$exit_code"
+    echo "pass="
+    echo "fail="
+    echo "skip="
+    echo "total="
+    echo "failed_suites="
+    echo "vollstaendig="
+    echo "repo_dir=$repo_dir"
+    echo "repo_commit=$repo_commit"
+    echo "repo_commit_ts=$repo_commit_ts"
+  } > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+  exit "$exit_code"
+fi
+
+# Rote Suiten einsammeln: Zeile beginnt mit einem der vier bekannten
+# Anzeige-Praefixe, gefolgt (durch Leerraum getrennt vom Namen) vom Wort
+# FAIL. Anker ist das Status-Wort, nicht eine feste Spaltenposition.
+failed_suites=$(printf '%s\n' "$output" | awk '
+  /^(shell\/tests\/|shell\/wb-consistency|hooks\/tests\/|extension\/)/ {
+    if (match($0, / (PASS|FAIL|SKIP) /)) {
+      status = substr($0, RSTART + 1, RLENGTH - 2)
+      name = substr($0, 1, RSTART - 1)
+      gsub(/[ \t]+$/, "", name)
+      if (status == "FAIL") print name
+    }
+  }
+' | paste -sd, -)
+
+fail_count_parsed=$(printf '%s\n' "$output" | awk '
+  /^(shell\/tests\/|shell\/wb-consistency|hooks\/tests\/|extension\/)/ {
+    if (match($0, / (PASS|FAIL|SKIP) /)) {
+      status = substr($0, RSTART + 1, RLENGTH - 2)
+      if (status == "FAIL") n++
+    }
+  }
+  END { print n + 0 }
+')
+
+parse_ok=1
+if [ "$fail_count_parsed" != "$fail" ]; then
+  # Gegenprobe schlaegt fehl -- Tabellenformat vermutlich veraendert.
+  # Zahlen aus der Summenzeile bleiben (die ist stabiler), Namensliste
+  # verwerfen statt falsche Namen zu melden.
+  parse_ok=0
+  failed_suites="UNPARSED"
+fi
+
+{
+  echo "# wb-testsuite-status.txt -- von wb-testsuite-run geschrieben, siehe Kopfkommentar dort."
+  echo "ts_epoch=$ts_epoch"
+  echo "ts_iso=$ts_iso"
+  echo "parse_ok=$parse_ok"
+  echo "exit_code=$exit_code"
+  echo "pass=$pass"
+  echo "fail=$fail"
+  echo "skip=$skip"
+  echo "total=$total"
+  echo "failed_suites=$failed_suites"
+  echo "vollstaendig=$vollstaendig"
+  echo "repo_dir=$repo_dir"
+  echo "repo_commit=$repo_commit"
+  echo "repo_commit_ts=$repo_commit_ts"
+} > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+
+exit "$exit_code"

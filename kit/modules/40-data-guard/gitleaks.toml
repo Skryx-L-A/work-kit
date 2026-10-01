@@ -1,0 +1,17 @@
+# gitleaks rules used by data-guard. Extends the built-in ruleset.
+# A finding that is a false positive: append the comment "gitleaks:allow" to that line,
+# or add its fingerprint to .gitleaksignore in the repository.
+title = "work-kit data guard"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "url-with-credentials"
+description = "URL with user and password (connection string)"
+regex = '''(?i)[a-z][a-z0-9+.-]{1,20}://[^\s/:@"']{1,64}:[^\s/@"']{4,128}@[^\s/"']{2,}'''
+keywords = ["://"]
+
+  [rules.allowlist]
+  description = "placeholders"
+  regexes = ['''(?i)://[^:@\s]+:(password|passwd|pass|secret|changeme|xxxx*|\*+|<[^>]*>|\$\{?[a-z_]+\}?|\{\{[^}]*\}\})@''']

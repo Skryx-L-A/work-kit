@@ -1,0 +1,82 @@
+# Omarchy keys on KDE Plasma 5 and 6 (kglobalshortcutsrc). Same columns as keys.tsv:
+#   key | action | kind:target
+#   kwin:<name>          KWin action in group [kwin]
+#   tile:<p5>;<p6>       Krohnkite action: its Plasma 5 name ; its Plasma 6 name (group [kwin])
+#   ksm:<name>           [ksmserver] action      shell:<name>   [plasmashell] action
+#   layout:<name>        [KDE Keyboard Layout Switcher] action
+#   svc:<desktop file>   the service's _launch key (KRunner, emoji picker)
+#   custom:<command>     own launcher (~/.local/share/applications/work-kit-desk-*.desktop)
+#   kde:<note>           Plasma already does this with its default key (listed for Super+K)
+#   none:<reason>        not available on Plasma
+# "DIGIT" expands to workspaces 1..9 and 0 (= 10), limited to the configured count.
+# PLUS is Omarchy's Super+= key: "=" with a US layout, the "+" key with a German one (there "=" is
+# Shift+0, which KWin sees as Meta+= and would clash with Super+Shift+0). kde_accel writes the keys
+# of the layout active at the Plasma login (kb_layout), shifted symbols by the symbol they type
+# (US Super+Shift+= is Meta++, German Super+Shift++ is Meta+*); `kit-desk keys` names the keys.
+SUPER + RETURN|Terminal|custom:@BIN@/kit-desk term
+SUPER + ALT + RETURN|Terminal with tmux|custom:@BIN@/kit-desk term --tmux
+SUPER + SHIFT + RETURN|Browser|custom:@BIN@/kit-desk browser
+SUPER + SHIFT + B|Browser|custom:@BIN@/kit-desk browser
+SUPER + SHIFT + ALT + B|Browser (private)|custom:@BIN@/kit-desk browser --private
+SUPER + SHIFT + F|File manager|custom:@BIN@/kit-desk files
+SUPER + SHIFT + N|Editor (nvim)|custom:@BIN@/kit-desk editor
+SUPER + CTRL + T|Activity (btop)|custom:@BIN@/kit-desk term -e btop
+SUPER + K|Show keybindings|custom:@BIN@/kit-desk keys --window
+SUPER + SHIFT + CTRL + SPACE|Theme menu|custom:@BIN@/kit-desk term -e @BIN@/kit-desk theme
+SUPER + ESCAPE|System menu: lock, log out, power off|custom:@BIN@/kit-desk power
+SUPER + ALT + SPACE|Kit menu: settings, keys, theme, system|custom:@BIN@/kit-desk menu
+SUPER + SPACE|Launcher (KRunner: apps and files)|svc:org.kde.krunner.desktop
+SUPER|Application menu|super:Meta alone opens the launcher menu
+ALT + F2|Run a command (KRunner)|kde:KRunner default key
+SUPER + CTRL + L|Lock screen|ksm:Lock Session
+CTRL + ALT + DELETE|Log out dialog|kde:ksmserver Log Out
+SUPER + W|Close window (Alt+F4 too)|kwin:Window Close
+SUPER + F|Full screen|kwin:Window Fullscreen
+SUPER + ALT + F|Maximize|kwin:Window Maximize
+SUPER + O|Keep above other windows|kwin:Window Above Other Windows
+SUPER + T|Toggle floating|tile:Krohnkite: Float;KrohnkiteToggleFloat
+SUPER + LEFT|Focus left|tile:Krohnkite: Left;KrohnkiteFocusLeft
+SUPER + RIGHT|Focus right|tile:Krohnkite: Right;KrohnkiteFocusRight
+SUPER + UP|Focus up|tile:Krohnkite: Up/Prev;KrohnkiteFocusUp
+SUPER + DOWN|Focus down|tile:Krohnkite: Down/Next;KrohnkiteFocusDown
+SUPER + SHIFT + LEFT|Swap window left|tile:Krohnkite: Move Left;KrohnkiteShiftLeft
+SUPER + SHIFT + RIGHT|Swap window right|tile:Krohnkite: Move Right;KrohnkiteShiftRight
+SUPER + SHIFT + UP|Swap window up|tile:Krohnkite: Move Up/Prev;KrohnkiteShiftUp
+SUPER + SHIFT + DOWN|Swap window down|tile:Krohnkite: Move Down/Next;KrohnkiteShiftDown
+SUPER + L|Next tiling layout|tile:Krohnkite: Next Layout;KrohnkiteNextLayout
+SUPER + J|Rotate layout (split direction)|tile:Krohnkite: Rotate;KrohnkiteRotate
+SUPER + CTRL + F|Monocle: one window fills the screen|tile:Krohnkite: Monocle Layout;KrohnkiteMonocleLayout
+SUPER + MINUS|Narrower window|tile:Krohnkite: Shrink Width;KrohnkiteShrinkWidth
+SUPER + PLUS|Wider window|tile:Krohnkite: Grow Width;KrohnkitegrowWidth
+SUPER + SHIFT + MINUS|Lower window|tile:Krohnkite: Shrink Height;KrohnkiteShrinkHeight
+SUPER + SHIFT + PLUS|Taller window|tile:Krohnkite: Grow Height;KrohnkiteGrowHeight
+SUPER + DIGIT|Switch to workspace DIGIT|kwin:Switch to Desktop DIGIT
+SUPER + SHIFT + DIGIT|Move window to workspace DIGIT (you stay)|kwin:Window to Desktop DIGIT
+SUPER + TAB|Next workspace|kwin:Switch to Next Desktop
+SUPER + SHIFT + TAB|Previous workspace|kwin:Switch to Previous Desktop
+ALT + TAB|Next window|kde:Walk Through Windows
+SUPER + mouse drag|Move / resize window (left / right button)|kde:KWin default
+SUPER + SHIFT + ALT + LEFT|Move window to the previous monitor|kwin:Window to Previous Screen
+SUPER + SHIFT + ALT + RIGHT|Move window to the next monitor|kwin:Window to Next Screen
+PRINT|Screenshot (Spectacle)|kde:Spectacle default keys
+XF86 media keys|Volume, brightness, media|kde:media keys work as before
+SUPER + CTRL + V|Clipboard history (Super+V too)|shell:show-on-mouse-pos
+SUPER + CTRL + E|Emoji picker (Super+. too)|svc:org.kde.plasma.emojier.desktop
+SUPER + CTRL + SPACE|Next keyboard layout|layout:Switch to Next Keyboard Layout
+SUPER + CTRL + A|Sound settings|custom:@BIN@/kit-desk settings sound
+SUPER + CTRL + B|Bluetooth settings|custom:@BIN@/kit-desk settings bluetooth
+SUPER + CTRL + W|Network settings|custom:@BIN@/kit-desk settings network
+SUPER + CTRL + D|Display settings|custom:@BIN@/kit-desk settings display
+SUPER + CTRL + P|Power settings|custom:@BIN@/kit-desk settings power
+SUPER + CTRL + S|All settings|custom:@BIN@/kit-desk settings
+SUPER + SHIFT + ALT + DIGIT|Move window silently to workspace DIGIT|kde:KWin never follows: same as Super+Shift+DIGIT
+SUPER + CTRL + TAB|Former workspace|none:no KWin back-and-forth binding
+SUPER + COMMA|Notifications|none:no Plasma key; click the bell in the panel
+SUPER + P|Pseudo tile|none:no KWin equivalent (Super+P stays display mode)
+SUPER + G|Window grouping (tabs)|none:no KWin equivalent
+SUPER + S|Scratchpad|none:no KWin equivalent
+SUPER + C / V / X|Universal copy / paste / cut|none:use Ctrl+C/V/X (Ctrl+Shift+C/V in terminals)
+SUPER + SHIFT + SPACE|Toggle top bar|none:the panel hides itself (auto-hide)
+SUPER + BACKSPACE|Toggle transparency|none:no KWin equivalent
+SUPER + CTRL + SPACE (Omarchy)|Background switcher|none:Super+Ctrl+Space switches the keyboard layout
+SUPER + SHIFT + (A C E G M O P S W X Y D SLASH)|Web apps and preinstalled apps|none:Omarchy apps and private services are not part of the kit

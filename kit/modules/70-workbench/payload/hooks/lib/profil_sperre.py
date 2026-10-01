@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""profil_sperre.py -- die Logik hinter dem PreToolUse-Hook profil-sperre.sh
+(docs/AGENTS-PLAN.md, Abschnitt 3 "Die Sperre" und Abschnitt 8 Regel 5 "Kein
+Eingriff ausserhalb der Welt"; docs/AGENTS-SPERREN.md).
+
+Der Hook greift NUR in einem Agentenzug: WB_AGENT_ZUG markiert den Kontext,
+WB_AGENT_ID und WB_WELT binden ihn (der Traeger setzt alle drei in
+agents_traeger._zugumgebung). Ohne alle drei keine Ausgabe; ein markierter Zug
+ohne vollstaendige Bindung sowie halbe oder ungueltige Umgebung werden verweigert.
+
+Massgeblich ist <WB_WELT>/agents/<id>/agent.json: Werkzeugliste `tools`,
+Bash-Muster `bash`, Kontextgrenze `context_limit`, Stufe `stage`. Laesst sich
+das Profil nicht lesen oder die Hausliste gesperrter Programme
+(wb-profil-gesperrt.json neben wb-profil) nicht laden, wird jedes Werkzeug
+verweigert (fail-closed).
+
+Vier Pruefungen:
+
+  1. Werkzeug: nur Werkzeuge aus `tools` (MultiEdit zaehlt als Edit).
+  2. Bash: jede ausfuehrbare Stufe -- auch in $( ), Backticks, eval,
+     <shell> -c, Here-Docs an eine Shell, hinter Wrappern und xargs -- muss
+     auf ein Muster passen (dieselbe Mustersprache wie die Rollen-Sperre:
+     reviewer_sperre.muster_passt), und keine Stufe darf auf der Hausliste
+     stehen, egal was das Muster erlaubt. Frei sind nur Shell-Bausteine
+     ohne eigene Wirkung (set, echo, test, ...), Kontrollwoerter und im
+     selben Befehl definierte Funktionen; deren Rumpf wird wie jeder Befehl
+     geprueft.
+  3. Weltgrenze fuer Bash-Pfade (Argumente, Umleitungen, cd, ausgefuehrte
+     Programme) und Read/Write/Edit/Glob/Grep:
+       lesen:     Projektordner, Worktree, Weltablage, Agentenverzeichnis,
+                  Skill- und Skriptpfade und beide Bibliotheken aus der
+                  Umgebung, das Brain (WB_BRAIN_KBASE, sonst ~/work/brain;
+                  ohne 90-secrets/ und .secrets-sync/), ~/.local/bin; Programme zusaetzlich
+                  aus den Systemordnern und den PATH-Ordnern ausserhalb von
+                  $HOME;
+       schreiben: im Projektordner nur der gemeinsame Ordner work/, dazu
+                  Worktree (der private Arbeitsordner, darin der git-Worktree
+                  des Agenten), eigenes Agentenverzeichnis, das eigene
+                  Temp-Verzeichnis (WB_AGENT_TMP). Das Brain schreibt kein Agent
+                  direkt, auch nicht der Hauptagent (Entscheidung vom 16.09.2026:
+                  nur ueber den Dienstweg brain.notiz). Die Geheimordner des
+                  Brains sind fuer jeden Zugriff gesperrt. Nie in einen git-Verwaltungsordner (.git): dort
+                  schreibt nur git selbst. In der Weltablage nur das eigene
+                  Agentenverzeichnis (eigene skills/ und skripte/ darin),
+                  und dort nie agent.json, skills.json, history.json,
+                  runtime.json oder das Postfach; freigaben.json und
+                  traeger.json nirgends. Welt- und Bibliotheksskripte sind
+                  damit wie Weltskills nie beschreibbar.
+     Die Kontextgrenze sperrt Pfade, die sie in `...` oder als Pfadwort nennt,
+     auch fuer das Lesen.
+  4. Zugaenge der Welt (<WB_WELT>/zugaenge.json, docs/AGENTS-SPERREN.md): nur
+     wenn der Traeger sie im Zug bereitgestellt hat (WB_ZUGAENGE nennt den
+     Ordner, darin je Zugang ein Unterordner). Ihre Muster geben ssh, scp und
+     rsync frei, aber nur ueber den nackten Programmnamen (die Huelle des
+     Zuges), ohne Wrapper, Variablen, Umleitung von PATH oder fremde Optionen;
+     der Zugangsordner selbst ist fuer jeden Zugriff gesperrt.
+  5. Mail senden (Entscheidung vom 16.09.2026; docs/AGENTS-SPERREN.md, "Mail senden"):
+     `<werkzeug> senden ...` nur, wenn der Agent in <WB_WELT>/freigaben.json eine
+     gueltige Freigabe `email` fuer dieses Werkzeug haelt (nicht widerrufen, nicht
+     abgelaufen, eine Weitergabe nur mit gueltiger Quelle und nicht weiter als sie);
+     eine `--von`-Adresse ausserhalb der Freigabe wird schon hier abgewiesen. Die
+     Sendewerkzeuge sind das Feld `werkzeug` jedes Eintrags der Datei, dazu immer
+     der Rueckfall MAIL_WERKZEUG. Die Freigabe ersetzt dafuer das Bash-Muster; ohne
+     sie hilft auch `<werkzeug> *` nicht. Massgeblich bleibt der Controller (mail.senden), der dieselbe Pruefung
+     ausserhalb der Sandbox wiederholt.
+  6. git im eigenen Worktree (Entscheidung vom 16.09.2026; docs/AGENTS-TRAEGER.md,
+     "Worktree je Agent"), zusaetzlich zu den Mustern: `git merge` nur fuer
+     Teamleiter (Zweige agent/<id> von Mitgliedern des eigenen Teams) und den
+     Hauptagenten (jeder Agentenzweig); kein `git worktree`, kein `git switch`,
+     `git checkout` nur als `git checkout -- <pfade>`; `git rebase` ohne
+     --exec, ohne -i und ohne zweiten Zweig; keine Konfiguration ueber -c,
+     --config-env, --exec-path, --git-dir, --work-tree oder --namespace und
+     keine Aenderung von GIT_*-Variablen (setzen, unset, env -i, exec -c):
+     sie kommen aus der Einstellungsdatei des Zuges und schalten Hooks ab.
+  6. Brain lesen (Entscheidung vom 16.09.2026): `brain search ...` ist ohne
+     eigenes Muster erlaubt, aber nur der Unterbefehl `search` und nur ueber
+     den nackten Programmnamen (die Huelle des Zuges); jeder andere Aufruf
+     von brain wird verweigert, auch wenn ein Profilmuster ihn freigaebe.
+
+Die Bash-Zerlegung ist lib/cmdshell.py. Grenzen: siehe hooks/README.md.
+"""
+import fnmatch
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import sys
+import unicodedata
+
+HOOKS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIB_DIR = os.path.join(HOOKS_DIR, 'lib')
+sys.path.insert(0, LIB_DIR)
+import cmdshell as cs  # noqa: E402
+from reviewer_sperre import muster_aufteilen, muster_passt  # noqa: E402  (dieselbe Mustersprache)
+
+FRIST_SEKUNDEN = 7
+MAX_DEPTH = 4
+ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+PROFIL_LIMIT = 1024 * 1024
+WERKZEUG_ALIAS = {'MultiEdit': 'Edit'}
+SCHREIBWERKZEUGE = {'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
+LESEWERKZEUGE = {'Read', 'Glob', 'Grep'}
+# Shell-Bausteine ohne eigene Wirkung: sie starten kein Programm und schreiben
+# nur ueber Umleitungen, die die Weltgrenze ohnehin prueft.
+BAUSTEINE = {'set', 'shift', 'exit', 'return', 'true', 'false', ':', 'test', '[', '[[', ']]', 'echo', 'printf',
+             'local', 'export', 'declare', 'typeset', 'readonly', 'unset', 'read', 'pwd', 'break', 'continue',
+             'cd', 'wait', 'umask', 'getopts'}
+KONTROLLE_MIT_BEFEHL = {'if', 'elif', 'while', 'until', '!'}
+KONTROLLE_OHNE_BEFEHL = {'for', 'case', 'select', 'in', 'esac', ';;', 'function'}
+ZUWEISUNGS_BEFEHLE = {'export', 'declare', 'typeset', 'local', 'readonly'}
+HARMLOSE_ZIELE = {'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'}
+MUTIERENDE = {'rm', 'rmdir', 'unlink', 'shred', 'mv', 'cp', 'install', 'ln', 'rsync', 'touch', 'chmod',
+              'chown', 'chgrp', 'truncate', 'tee', 'dd', 'mkdir', 'patch'}
+QUELLE_ZIEL = {'cp', 'install', 'rsync', 'ln'}
+RECHTEERHOEHUNG = {'sudo', 'doas', 'su', 'pkexec'}
+SONDERVARIABLE_RE = re.compile(r'\$\{?[0-9@*#]')
+MIT_I_OPTION = {'sed', 'perl', 'ruby'}
+SYSTEM_PROGRAMME = ('/bin', '/usr/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/libexec')
+GESCHUETZT_EIGEN = {'agent.json', 'skills.json', 'history.json', 'runtime.json'}
+GESCHUETZT_UEBERALL = {'freigaben.json', 'traeger.json', 'zugaenge.json', 'mail-versand.jsonl'}
+ZUGANG_PROGRAMME = {'ssh', 'scp', 'rsync'}
+# Brain (16.09.2026): Geheimordner im Kbase, fuer jeden Zugriff gesperrt; lesen nur ueber `brain search`.
+BRAIN_GEHEIM = ('90-secrets', '.secrets-sync')
+BRAIN_PROGRAMM = 'brain'
+# Gemeinsamer Ordner des Projekts (agents_traeger.PROJEKT_ARBEITSORDNER); sonst ist das Projekt nur lesbar.
+PROJEKT_ARBEIT = 'work'
+GIT_UMGEBUNG_RE = re.compile(r'^GIT_[A-Za-z0-9_]*(=|$)')
+GIT_GLOBAL_GESPERRT = ('-c', '--config-env', '--exec-path', '--git-dir', '--work-tree', '--namespace')
+# Umgebung leeren oder Variablen entfernen: env -i/-/-u, exec -c.
+UMGEBUNG_LEEREN = ('-i', '-', '--ignore-environment', '-u', '--unset', '-c')
+AGENTENZWEIG_RE = re.compile(r'^agent/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$')
+MERGE_MIT_WERT = {'-m', '--message', '-F', '--file', '-X', '--strategy-option', '--into-name', '--cleanup'}
+REBASE_OPTIONEN = {'--continue', '--abort', '--skip', '--quit', '-q', '--quiet', '-v', '--verbose', '--stat', '-n',
+                   '--no-stat', '-m', '--merge', '--keep-empty', '--no-keep-empty', '--ignore-date',
+                   '--committer-date-is-author-date', '--reset-author-date', '--no-ff', '--force-rebase', '-f',
+                   '--no-autostash', '--no-verify'}
+FREIGABEN_LIMIT = 256 * 1024
+FREIGABE_TIEFE = 4
+# Rueckfall fuer Freigaben ohne Feld `werkzeug` (vor der Hostkonfiguration mailkonten.json erteilt); es braucht
+# immer eine Freigabe zum Senden. Weitere Sendewerkzeuge nennen die Eintraege selbst (agents_freigaben.WERKZEUG_RE).
+MAIL_WERKZEUG = 'wb-myproject'
+MAIL_WERKZEUG_RE = re.compile(r'^wb-[a-z0-9][a-z0-9-]{0,39}$')
+ZUGANG_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{0,39}$')
+ZUGANG_LIMIT = 256 * 1024
+# Optionen ohne eigenes Argument, die lokal nichts ausfuehren; alles andere (-e, -o, -F, -S, --rsh, ...) ist gesperrt.
+SCP_BUCHSTABEN = set('rpqCv346')
+RSYNC_BUCHSTABEN = set('avzrlptgoDhPcnuqiHmx')
+RSYNC_LANG = {'--archive', '--verbose', '--compress', '--recursive', '--links', '--perms', '--times', '--delete',
+              '--progress', '--partial', '--dry-run', '--checksum', '--update', '--human-readable', '--stats',
+              '--itemize-changes', '--mkpath', '--one-file-system'}
+RSYNC_LANG_WERT = ('--exclude=', '--include=')
+PATH_RE = re.compile(r'(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])')
+IFS_RE = re.compile(r'\$\{?IFS')
+# Funktionsdefinition am Anfang einer Anweisung: `f() {`, `f () (` oder `function f`. Gesucht wird im
+# Text ohne Anfuehrungen, damit `echo "curl()"` keine Funktion curl erfindet.
+FUNKTION_RE = re.compile(r'(?:^|[;&|\n]|&&|\|\|)\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)'
+                         r'|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*[{(])')
+ANFUEHRUNG_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+VARIABLE_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)')
+
+_ausgegeben = False
+
+
+class Verweigert(Exception):
+    """Grund einer Verweigerung."""
+
+
+def _deny_json(reason):
+    return json.dumps({'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+        'permissionDecisionReason': reason}}, ensure_ascii=False)
+
+
+def print_deny(reason):
+    global _ausgegeben
+    _ausgegeben = True
+    print(_deny_json('Profile lock: ' + reason), flush=True)
+
+
+def _frist_abgelaufen(*_):
+    if not _ausgegeben:
+        try:
+            os.write(1, (_deny_json('Profile lock: the check ran out of time -- without a result the access stays locked.') + '\n').encode())
+        except OSError:
+            pass
+    os._exit(0)
+
+
+def alarm_setzen():
+    try:
+        signal.signal(signal.SIGALRM, _frist_abgelaufen)
+        signal.alarm(FRIST_SEKUNDEN)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def _unter(pfad, wurzel):
+    return bool(wurzel) and (pfad == wurzel or pfad.startswith(wurzel.rstrip(os.sep) + os.sep))
+
+
+def _datei_lesen(pfad, grenze):
+    fd = os.open(pfad, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > grenze:
+            raise OSError('keine gewoehnliche Datei oder zu gross')
+        return os.read(fd, grenze + 1)
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------ Hausliste --
+def _norm(text):
+    return unicodedata.normalize('NFKC', text or '').lower()
+
+
+class Hausliste:
+    """Die Hausliste aus wb-profil, auf Befehle angewandt: eine Programmregel trifft den
+    Programmnamen (Basisname, NFKC, ohne Gross/Klein), ihre `erfordert`-Teile die Argumente --
+    ein Kurzoptionsbuendel wie `-rf` auch zerlegt (`-r -f`, `-fR`); eine Musterregel trifft den
+    ganzen Befehlstext. Anders als die Profilpruefung in wb-profil zaehlt ein Programmname in einem
+    Argument (`git commit -m "kill"`) nicht."""
+
+    def __init__(self, daten):
+        self.programme = [r for r in daten.get('programme', []) if isinstance(r, dict) and r.get('programm')]
+        self.muster = [r for r in daten.get('muster', []) if isinstance(r, dict) and r.get('enthaelt')]
+
+    @staticmethod
+    def _erfordert(teil, worte):
+        teil = _norm(teil)
+        if teil in worte:
+            return True
+        if re.fullmatch(r'-[a-z]{2,}', teil):
+            buchstaben = set()
+            for w in worte:
+                if re.fullmatch(r'-[a-z]+', w):
+                    buchstaben.update(w[1:])
+            return set(teil[1:]) <= buchstaben
+        return any(teil in w for w in worte)
+
+    def stufe(self, programm, worte):
+        name = _norm(os.path.basename(programm))
+        klein = [_norm(w) for w in worte]
+        for regel in self.programme:
+            if name == _norm(regel['programm']) and all(self._erfordert(t, klein) for t in regel.get('erfordert', [])):
+                return regel.get('grund') or regel['programm']
+        return None
+
+    def text(self, befehl):
+        norm = _norm(befehl)
+        for regel in self.muster:
+            if _norm(regel['enthaelt']) in norm:
+                return regel.get('grund') or regel['enthaelt']
+        return None
+
+
+def hausliste_laden():
+    """Hausliste aus wb-profil; Verweigert, wenn nicht ladbar oder leer."""
+    ziel = os.environ.get('WB_PROFIL_BIN') or shutil.which('wb-profil')
+    if not ziel or not os.path.isfile(ziel):
+        raise Verweigert('wb-profil is missing -- without the house list of locked programs nothing is allowed')
+    try:
+        loader = importlib.machinery.SourceFileLoader('wb_profil_hausliste', ziel)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        modul = importlib.util.module_from_spec(spec)
+        loader.exec_module(modul)
+        gesperrt = modul.gesperrt_laden()
+    except Exception:  # noqa: BLE001 - jeder Ladefehler sperrt
+        raise Verweigert('the house list of locked programs (wb-profil) cannot be loaded')
+    if not isinstance(gesperrt, dict) or not gesperrt.get('programme'):
+        raise Verweigert('the house list of locked programs is empty or unreadable -- without it nothing is allowed')
+    return Hausliste(gesperrt)
+
+
+# --------------------------------------------------------------- Profil --
+def _kontext_muster(text, home):
+    """Pfade und Muster, die eine Kontextgrenze nennt: Text in Backticks oder Woerter, die
+    mit /, ~/ oder ./ beginnen. Ein Satz ohne solche Angaben sperrt keinen Pfad."""
+    kandidaten = re.findall(r'`([^`]+)`', text or '')
+    for wort in re.split(r'\s+', re.sub(r'`[^`]*`', ' ', text or '')):
+        wort = wort.strip('.,;:!?()"\'')
+        if wort.startswith(('/', '~/', './')):
+            kandidaten.append(wort)
+    muster = []
+    for k in kandidaten:
+        k = k.strip()
+        if not k or not (k.startswith(('/', '~', '.')) or '*' in k or '/' in k):
+            continue
+        k = home + k[1:] if k.startswith('~') else k
+        muster.append(k.rstrip('/') or '/')
+    return muster
+
+
+def _kontext_aufloesen(muster, projekt):
+    """Absolute Muster bleiben; relative gelten unter dem Projektordner, ohne Projekt gar nicht."""
+    result = []
+    for m in muster:
+        if not os.path.isabs(m):
+            if not projekt:
+                continue
+            m = os.path.join(projekt, m[2:] if m.startswith('./') else m)
+        result.append(m if '*' in m else os.path.realpath(m))
+    return result
+
+
+class Profil:
+    def __init__(self, welt, agent, daten, hausliste, umgebung):
+        self.welt_roh = welt
+        self.welt = os.path.realpath(welt)
+        self.agent = agent
+        self.home = os.path.realpath(os.path.expanduser('~'))
+        self.stufe = daten.get('stage')
+        self.team = daten.get('team')
+        tools = daten.get('tools')
+        bash = daten.get('bash') if daten.get('bash') is not None else []
+        grenze = daten.get('context_limit') or ''
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools) \
+                or not isinstance(bash, list) or not all(isinstance(b, str) for b in bash) \
+                or not isinstance(grenze, str) or daten.get('id') != agent:
+            raise Verweigert('agent.json is incomplete or does not belong to %s' % agent)
+        self.tools = set(tools)
+        self.muster, self.generisch = muster_aufteilen(bash)
+        self.hausliste = hausliste
+        self.eigenes = os.path.realpath(os.path.join(welt, 'agents', agent))
+        self.agenten = os.path.realpath(os.path.join(welt, 'agents'))
+
+        def verzeichnis(name, pflicht=False):
+            wert = (umgebung.get(name) or '').strip()
+            if not wert:
+                return None
+            if not os.path.isabs(wert) or not os.path.isdir(wert):
+                raise Verweigert('%s is not an absolute folder' % name)
+            real = os.path.realpath(wert)
+            if real in ('/', self.home):
+                raise Verweigert('%s umfasst zu viel (%s)' % (name, real))
+            return real
+
+        self.projekt = verzeichnis('WB_WELT_PROJEKT')
+        self.worktree = verzeichnis('WB_AGENT_WORKTREE')
+        self.tmp = verzeichnis('WB_AGENT_TMP')
+        self.bibliothek = verzeichnis('WB_SKILL_BIBLIOTHEK')
+        self.skriptbibliothek = verzeichnis('WB_SKRIPT_BIBLIOTHEK')
+        self.zugang_ordner = verzeichnis('WB_ZUGAENGE')
+        self.zugaenge = zugaenge_laden(welt, self.zugang_ordner)
+        # Skill- und Skriptpfade aus skills.json (skills_umgebung): lesbar und ausfuehrbar, nie beschreibbar.
+        self.skillpfade = [os.path.realpath(p) for name in ('WB_SKILL_PFADE', 'WB_SKRIPT_PFADE')
+                           for p in (umgebung.get(name) or '').split(os.pathsep) if p and os.path.isabs(p)]
+        self.kontext = _kontext_aufloesen(_kontext_muster(grenze, self.home), self.projekt)
+        # Im Zug ist $HOME ein Sandbox-Ordner; das Kbase des Traegerhosts nennt WB_BRAIN_KBASE.
+        self.knowledge = verzeichnis('WB_BRAIN_KBASE') or os.path.realpath(os.environ.get('BRAIN_HOME') or os.path.join(self.home, 'work', 'brain'))  # kit: the 20-brain notes
+        self.brain_geheim = [os.path.join(self.knowledge, name) for name in BRAIN_GEHEIM]
+        self.localbin = os.path.realpath(os.path.join(self.home, '.local', 'bin'))
+
+    def lesewurzeln(self):
+        return [w for w in [self.projekt, self.worktree, self.welt, self.tmp, self.bibliothek, self.skriptbibliothek,
+                            self.knowledge, self.localbin] + self.skillpfade if w]
+
+    def projekt_arbeit(self):
+        return os.path.join(self.projekt, PROJEKT_ARBEIT) if self.projekt else None
+
+    def schreibwurzeln(self):
+        return [w for w in (self.projekt_arbeit(), self.worktree, self.eigenes, self.tmp) if w]
+
+    def kontext_trifft(self, real):
+        for m in self.kontext:
+            if '*' in m:
+                if fnmatch.fnmatch(real, m) or fnmatch.fnmatch(real, m.rstrip('/') + '/*'):
+                    return m
+            elif _unter(real, m):
+                return m
+        return None
+
+    def pfad(self, roh, real, art):
+        """Verweigert, wenn der kanonische Pfad fuer die Art lesen|schreiben|ausfuehren
+        ausserhalb der Weltgrenze liegt oder geschuetzt ist."""
+        if real in HARMLOSE_ZIELE:
+            return
+        # casefold: auf einem Dateisystem ohne Gross-/Kleinschreibung ist 90-SECRETS derselbe Ordner.
+        kandidaten = {real.casefold(), (os.path.normpath(roh) if os.path.isabs(roh) else real).casefold()}
+        if any(_unter(k, geheim.casefold()) for k in kandidaten for geheim in self.brain_geheim):
+            raise Verweigert("'%s' liegt in einem Geheimordner des Brains; Agenten lesen ihn nie" % roh)
+        if self.zugang_ordner and _unter(real, self.zugang_ordner):
+            raise Verweigert("'%s' lies in the access folder of the turn; keys and configuration are read only by ssh itself"
+                             % roh)
+        treffer = self.kontext_trifft(real)
+        if treffer:
+            raise Verweigert("'%s' lies inside the context boundary of the profile (%s)" % (roh, treffer))
+        if art == 'schreiben':
+            if os.path.basename(real) in GESCHUETZT_UEBERALL:
+                raise Verweigert("'%s' is an approval or carrier file; agents never write it" % roh)
+            if (os.sep + '.git' + os.sep) in (real + os.sep):
+                raise Verweigert("'%s' lies in a git administration folder; only git itself writes there" % roh)
+            if _unter(real, self.welt):
+                if not _unter(real, self.eigenes) or real == self.eigenes:
+                    raise Verweigert("'%s' lies in the world store outside your own agent folder" % roh)
+                teile = os.path.relpath(real, self.eigenes).split(os.sep)
+                if teile[0] in GESCHUETZT_EIGEN or teile[0] == 'postfach':
+                    raise Verweigert("'%s' is written only by the workbench, not by the agent itself" % roh)
+                return
+            if not any(_unter(real, w) for w in self.schreibwurzeln()):
+                if _unter(real, self.knowledge):
+                    raise Verweigert("'%s' lies in the brain; notes are written by the carrier through the service path brain.notiz, never by an agent directly" % roh)
+                if self.projekt and _unter(real, self.projekt):
+                    raise Verweigert("'%s' liegt im Projekt ausserhalb von %s/; am Projekt arbeitet ein Agent in "
+                                     "seinem eigenen Worktree" % (roh, PROJEKT_ARBEIT))
+                raise Verweigert("'%s' lies outside work/ of the project, the worktree and the agent folder" % roh)
+            return
+        wurzeln = self.lesewurzeln()
+        if art == 'ausfuehren':
+            wurzeln = wurzeln + programmordner(self.home)
+        if not any(_unter(real, w) for w in wurzeln):
+            raise Verweigert("'%s' lies outside the world (reading only: project, worktree, world store, skills and scripts from skills.json, the kit brain and ~/.local/bin)" % roh)
+
+
+def zugaenge_laden(welt, ordner):
+    """Zugaenge der Welt, die der Traeger in diesem Zug bereitgestellt hat: {name: [muster]}.
+
+    Ohne WB_ZUGAENGE, ohne zugaenge.json oder bei unlesbarer Datei keine Freigabe; ein Zugang
+    zaehlt nur, wenn sein Unterordner im Zugangsordner liegt."""
+    if not ordner:
+        return {}
+    pfad = os.path.join(welt, 'zugaenge.json')
+    try:
+        daten = json.loads(_datei_lesen(pfad, ZUGANG_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    eintraege = daten.get('zugaenge') if isinstance(daten, dict) else None
+    result = {}
+    for eintrag in eintraege if isinstance(eintraege, list) else []:
+        if not isinstance(eintrag, dict):
+            continue
+        name = eintrag.get('name')
+        muster = eintrag.get('muster')
+        if not isinstance(name, str) or not ZUGANG_NAME_RE.match(name) or (eintrag.get('art') or 'ssh') != 'ssh':
+            continue
+        if muster is None:
+            muster = ['ssh %s *' % name, 'scp *%s:*' % name, 'rsync *%s:*' % name]
+        if not isinstance(muster, list) or not all(isinstance(m, str) for m in muster):
+            continue
+        unter = os.path.join(ordner, name)
+        if os.path.islink(unter) or not os.path.isdir(unter):
+            continue
+        gueltig, _generisch = muster_aufteilen([m for m in muster if m.split()[:1] and m.split()[0] in ZUGANG_PROGRAMME])
+        if gueltig:
+            result[name] = gueltig
+    return result
+
+
+def _zeitpunkt(wert):
+    import datetime
+    try:
+        zeit = datetime.datetime.fromisoformat(str(wert).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return zeit if zeit.tzinfo else zeit.replace(tzinfo=datetime.timezone.utc)
+
+
+def _freigaben_eintraege(welt):
+    """Eintraege aus <welt>/freigaben.json; unlesbar oder fremde Form eine leere Liste."""
+    try:
+        daten = json.loads(_datei_lesen(os.path.join(welt, 'freigaben.json'), FREIGABEN_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return []
+    eintraege = daten.get('freigaben') if isinstance(daten, dict) and daten.get('version') == 1 else None
+    if not isinstance(eintraege, list):
+        return []
+    return [e for e in eintraege if isinstance(e, dict) and isinstance(e.get('id'), str)]
+
+
+def _werkzeug_von(e):
+    """Sendewerkzeug eines Eintrags; ohne Feld der Rueckfall, eine fremde Form None (der Eintrag gilt dann nie)."""
+    werkzeug = e.get('werkzeug')
+    if werkzeug is None:
+        return MAIL_WERKZEUG
+    return werkzeug if isinstance(werkzeug, str) and MAIL_WERKZEUG_RE.match(werkzeug) else None
+
+
+def mail_werkzeuge(welt):
+    """Programmnamen, deren `senden` eine Freigabe braucht: der Rueckfall und das Werkzeug jedes Eintrags, auch
+    widerrufener oder abgelaufener, damit ein entzogenes Konto nicht auf die Bash-Muster zurueckfaellt."""
+    namen = {MAIL_WERKZEUG}
+    if welt:
+        namen |= {w for w in map(_werkzeug_von, _freigaben_eintraege(welt)) if w}
+    return namen
+
+
+def mail_freigabe(welt, agent, jetzt=None, werkzeug=MAIL_WERKZEUG):
+    """Absenderadressen der gueltigen Freigaben `email` eines Agenten fuer ein Sendewerkzeug aus <welt>/freigaben.json
+    (dieselben Regeln wie agents_freigaben.gueltig); unlesbar oder ohne Treffer eine leere Liste."""
+    import datetime
+    jetzt = jetzt or datetime.datetime.now(datetime.timezone.utc)
+    eintraege = _freigaben_eintraege(welt)
+    nach_id = {e['id']: e for e in eintraege}
+
+    def adressen(e):
+        liste = e.get('adressen')
+        return [a.get('adresse') for a in liste if isinstance(a, dict) and isinstance(a.get('adresse'), str)] \
+            if isinstance(liste, list) else []
+
+    def gilt(e, tiefe=0):
+        if tiefe > FREIGABE_TIEFE or e.get('widerrufen') or e.get('art') != 'email':
+            return False
+        if e.get('ablauf'):
+            ende = _zeitpunkt(e['ablauf'])
+            if ende is None or ende <= jetzt:
+                return False
+        von = e.get('erteilt_von') if isinstance(e.get('erteilt_von'), dict) else {}
+        if e.get('quelle') is None:
+            return von.get('art') == 'mensch'
+        quelle = nach_id.get(e.get('quelle'))
+        if quelle is None or von.get('art') != 'agent' or quelle.get('inhaber') != von.get('id') \
+                or quelle.get('konto') != e.get('konto') or quelle.get('werkzeug') != e.get('werkzeug') \
+                or not set(adressen(e)) <= set(adressen(quelle)):
+            return False
+        if quelle.get('ablauf'):
+            ende, quellende = _zeitpunkt(e.get('ablauf') or ''), _zeitpunkt(quelle['ablauf'])
+            if ende is None or quellende is None or ende > quellende:
+                return False
+        # Im Zug ist nur das eigene agent.json eingebunden: ist das Profil des Gebers nicht lesbar, prueft das
+        # der Controller (agents_freigaben.gueltig mit Weltablage); ein lesbares Profil ohne Stufe hauptagent zaehlt nie.
+        geber = _agent_profil(welt, str(von.get('id')))
+        if geber is not None and geber.get('stage') != 'hauptagent':
+            return False
+        return gilt(quelle, tiefe + 1)
+
+    result = []
+    for e in eintraege:
+        if e.get('inhaber') == agent and _werkzeug_von(e) == werkzeug and gilt(e):
+            result += [a for a in adressen(e) if a not in result]
+    return result
+
+
+def programmordner(home):
+    """Systemordner und die PATH-Ordner des Hooks ausserhalb von $HOME; den PATH setzt der Traeger."""
+    ordner = [os.path.realpath(p) for p in SYSTEM_PROGRAMME]
+    for eintrag in (os.environ.get('PATH') or '').split(os.pathsep):
+        if os.path.isabs(eintrag) and os.path.isdir(eintrag):
+            real = os.path.realpath(eintrag)
+            if not _unter(real, home) and real != '/':
+                ordner.append(real)
+    return ordner
+
+
+def profil_laden():
+    """None ohne Agentenzug, sonst Profil oder Verweigert."""
+    agent = (os.environ.get('WB_AGENT_ID') or '').strip()
+    welt = (os.environ.get('WB_WELT') or '').strip()
+    agentenkontext = bool((os.environ.get('WB_AGENT_ZUG') or '').strip())
+    if not agent and not welt:
+        if agentenkontext:
+            raise Verweigert('Agent turn without binding: WB_AGENT_ID and WB_WELT must both be set')
+        return None
+    if not agent or not welt:
+        raise Verweigert('WB_AGENT_ID and WB_WELT must both be set')
+    if not ID_RE.fullmatch(agent):
+        raise Verweigert('WB_AGENT_ID ist ungueltig')
+    if not os.path.isabs(welt) or not os.path.isdir(welt):
+        raise Verweigert('WB_WELT is not an absolute world folder')
+    welt = os.path.abspath(welt)
+    pfad = os.path.join(welt, 'agents', agent, 'agent.json')
+    for teil in (os.path.join(welt, 'agents'), os.path.join(welt, 'agents', agent), pfad):
+        if os.path.islink(teil):
+            raise Verweigert('Pfad zu agent.json enthaelt einen Symlink')
+    gemeldet = (os.environ.get('WB_AGENT_PROFIL') or '').strip()
+    if gemeldet and os.path.realpath(gemeldet) != os.path.realpath(pfad):
+        raise Verweigert("WB_AGENT_PROFIL does not point at the agent's agent.json")
+    try:
+        daten = json.loads(_datei_lesen(pfad, PROFIL_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise Verweigert("the agent's agent.json cannot be read -- without a profile nothing is allowed")
+    if not isinstance(daten, dict):
+        raise Verweigert('agent.json is not an object')
+    return Profil(welt, agent, daten, hausliste_laden(), os.environ)
+
+
+# ------------------------------------------------------------- Pfade ----
+def _variablen(wort, varmap):
+    def ersetzen(m):
+        name = m.group(1) or m.group(2)
+        return varmap[name] if name in varmap else os.environ.get(name, '')
+
+    for _ in range(6):
+        neu = VARIABLE_RE.sub(ersetzen, wort)
+        if neu == wort:
+            break
+        wort = neu
+    return wort
+
+
+def _expandieren(wort, varmap, home):
+    wert = _variablen(wort, varmap)
+    if '$(' in wert or '`' in wert:
+        return None
+    if wert == '~' or wert.startswith('~/'):
+        wert = home + wert[1:]
+    return wert
+
+
+def _ist_pfadwort(wert, cwd, schreibend):
+    """Ob ein Argument als Pfad gilt. Absolute Woerter nur, wenn ihr erster Bestandteil
+    existiert (`/api/` ist eher ein Muster als ein Pfad); relative mit ./, ../, .. oder wenn
+    sie im Arbeitsverzeichnis existieren; bei schreibenden Befehlen jedes Wort."""
+    if not wert or wert.startswith('-') or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', wert):
+        return False
+    if wert.startswith('/'):
+        erstes = wert.lstrip('/').split('/', 1)[0]
+        return schreibend or not erstes or os.path.lexists('/' + erstes)
+    if wert in ('.', '..') or wert.startswith(('./', '../')) or '/../' in wert or wert.endswith('/..'):
+        return True
+    return schreibend or os.path.lexists(os.path.join(cwd, wert))
+
+
+class Pruefung:
+    def __init__(self, profil):
+        self.p = profil
+
+    def zugriff(self, wort, varmap, cwd, art, immer=False):
+        if wort.startswith('--') and '=' in wort:
+            wort = wort.split('=', 1)[1]
+        if art in ('schreiben', 'ausfuehren') and _unbestimmt(wort, varmap):
+            raise Verweigert("'%s' takes its target from a variable that is only known at run time" % wort)
+        wert = _expandieren(wort, varmap, self.p.home)
+        if wert is None:
+            if art in ('schreiben', 'ausfuehren'):
+                raise Verweigert("'%s' contains a command substitution; target cannot be checked" % wort)
+            return
+        if not immer and not _ist_pfadwort(wert, cwd, art == 'schreiben'):
+            return
+        if '*' in wert or '?' in wert or '[' in wert:
+            wert = re.split(r'[*?\[]', wert, 1)[0] or '.'
+        absolut = wert if os.path.isabs(wert) else os.path.join(cwd, wert)
+        self.p.pfad(wort, os.path.realpath(absolut), art)
+
+    def muster(self, text, voll):
+        if not any(muster_passt(text, m) or muster_passt(voll, m) for m in self.p.muster):
+            hinweis = ''
+            if self.p.generisch:
+                hinweis = ' (the profile patterns %s allow nothing as a wrapper or interpreter)' % \
+                    ', '.join("'%s'" % g for g in self.p.generisch)
+            raise Verweigert("'%s' is not in the Bash patterns of the agent%s" % (text, hinweis))
+
+    def hausliste_text(self, befehl):
+        grund = self.p.hausliste.text(befehl)
+        if grund:
+            raise Verweigert('the command touches a locked pattern of the house list: %s' % grund)
+
+    def hausliste_stufe(self, programm, worte):
+        grund = self.p.hausliste.stufe(programm, worte)
+        if grund:
+            raise Verweigert("'%s' is on the house list of locked programs: %s"
+                             % (' '.join([programm] + worte), grund))
+
+    def bash(self, command, cwd, depth=0, funktionen=None):
+        if depth > MAX_DEPTH:
+            raise Verweigert('Kommando zu tief verschachtelt')
+        if IFS_RE.search(command):
+            raise Verweigert('IFS expansion cannot be resolved safely')
+        ohne_anfuehrung = ANFUEHRUNG_RE.sub('""', command)
+        funktionen = set(funktionen or ()) | {a or b for a, b in FUNKTION_RE.findall(ohne_anfuehrung)}
+        teile = cs.heredoc_split(command)
+        if not teile.complete:
+            raise Verweigert('here-doc without a closing line')
+        subs, vollstaendig = cs.command_substitutions(teile.text_subs)
+        if not vollstaendig:
+            raise Verweigert('unvollstaendige Kommandosubstitution')
+        for b in teile.bodies:
+            if b['top'] and not b['quoted']:
+                weitere, vollstaendig = cs.command_substitutions(b['body'], quotes=False)
+                if not vollstaendig:
+                    raise Verweigert('unvollstaendige Kommandosubstitution im Here-Doc')
+                subs.extend(weitere)
+        for inner in subs:
+            self.bash(inner, cwd, depth + 1, funktionen)
+        for b in teile.bodies:
+            if not b['top']:
+                continue
+            kopf = cs.all_statements(b['prefix'])
+            if not kopf or kopf[-1] is None or not cs.split_pipeline(kopf[-1]):
+                raise Verweigert('here-doc without a recognizable receiver')
+            name, _i, rest = cs.resolve_command(cs.split_pipeline(kopf[-1])[-1], {})
+            if name in cs.SHELL_INTERPRETERS and not cs.shell_c_script(rest)[0]:
+                self.bash(b['body'], cwd, depth + 1, funktionen)
+        leser = cs.process_substitution_script(teile.text)
+        if leser:
+            raise Verweigert('%s liest sein Skript aus einer Prozess-Substitution' % leser)
+        anweisungen = cs.all_statements(teile.text)
+        if anweisungen == [None]:
+            raise Verweigert('Kommando nicht zerlegbar')
+        for stmt, varmap in zip(anweisungen, cs.assignment_prefixes(anweisungen)):
+            for raw_stage in cs.split_pipeline(stmt, strip=False):
+                cwd = self.stufe(raw_stage, varmap, cwd, depth, funktionen)
+
+    def stufe(self, raw_stage, varmap, cwd, depth, funktionen):
+        for _op, ziel in cs.output_redirections(raw_stage):
+            if ziel and ziel not in HARMLOSE_ZIELE and not re.fullmatch(r'&?[0-9-]', ziel):
+                self.zugriff(ziel, varmap, cwd, 'schreiben', immer=True)
+        for quelle in _eingaben(raw_stage):
+            self.zugriff(quelle, varmap, cwd, 'lesen', immer=True)
+        stage = cs.strip_redirections(raw_stage)
+        name, idx, rest = cs.resolve_command(stage, varmap)
+        if name is None:
+            if any(t.startswith('IFS=') for t in stage):
+                raise Verweigert('IFS change cannot be resolved safely')
+            _git_umgebung_pruefen(stage)
+            return cwd
+        if name in (cs.SUBSHELL_TOKEN, cs.PROCSUB_TOKEN):
+            return cwd
+        _git_umgebung_pruefen(stage[:idx])
+        if name in ZUWEISUNGS_BEFEHLE or name == 'unset':
+            _git_umgebung_pruefen(rest)
+        roh = _variablen(stage[idx], varmap)
+        worte = [_variablen(t, varmap) for t in rest]
+        text = ' '.join([name] + worte)
+        voll = ' '.join([roh] + worte)
+        self.hausliste_stufe(roh, worte)
+        if any(os.path.basename(_variablen(t, varmap)) in RECHTEERHOEHUNG for t in stage[:idx + 1]):
+            raise Verweigert('privilege escalation (%s) is locked for agents' % ' '.join(stage[:idx + 1]))
+        if name in KONTROLLE_MIT_BEFEHL:
+            return self.stufe(rest, varmap, cwd, depth, funktionen) if rest else cwd
+        if name in KONTROLLE_OHNE_BEFEHL or name in cs.BLOCK_KEYWORDS:
+            return cwd
+        if name in ZUWEISUNGS_BEFEHLE and any(w.startswith('IFS=') for w in worte):
+            raise Verweigert('IFS change cannot be resolved safely')
+        if '/' in roh:
+            self.zugriff(stage[idx], varmap, cwd, 'ausfuehren', immer=True)
+        if name == 'cd':
+            ziele = [w for w in rest if not w.startswith('-')]
+            if not ziele:
+                self.p.pfad('cd', self.p.home, 'lesen')
+                return self.p.home
+            wert = _expandieren(ziele[0], varmap, self.p.home)
+            if wert is None:
+                raise Verweigert('cd with a command substitution cannot be checked')
+            real = os.path.realpath(wert if os.path.isabs(wert) else os.path.join(cwd, wert))
+            self.p.pfad(ziele[0], real, 'lesen')
+            return real
+        if name == 'eval':
+            if rest:
+                self.bash(' '.join(rest), cwd, depth + 1, funktionen)
+            return cwd
+        if name in cs.SHELL_INTERPRETERS:
+            hat_c, skript = cs.shell_c_script(worte)
+            if hat_c:
+                if skript is None:
+                    raise Verweigert('%s -c ohne Skript' % name)
+                self.bash(skript, cwd, depth + 1, funktionen)
+                return cwd
+        if name == 'xargs':
+            innen = cs.xargs_inner(rest) or ['echo']
+            if self.p.zugaenge and os.path.basename(_variablen(innen[0], varmap)) in ZUGANG_PROGRAMME | {'hash'}:
+                raise Verweigert('access commands do not run through xargs; their arguments must be in the command')
+            if depth >= MAX_DEPTH:
+                raise Verweigert('Kommando zu tief verschachtelt')
+            return self.stufe(innen, varmap, cwd, depth + 1, funktionen) or cwd
+        if name in BAUSTEINE:
+            return cwd  # keine Programme, keine Dateien ausser Umleitungen (oben geprueft)
+        if self.p.zugaenge and name == 'hash':
+            raise Verweigert('hash is locked while accesses are provided')
+        if self.p.zugaenge and name in ZUGANG_PROGRAMME and name not in funktionen:
+            zugang = self.zugang_treffer(text, voll)
+            if zugang is not None:
+                self.zugang(zugang, name, stage, idx, rest, varmap, cwd)
+                return cwd
+        if name == BRAIN_PROGRAMM and name not in funktionen:
+            if roh != BRAIN_PROGRAMM or not worte or worte[0] != 'search':
+                raise Verweigert('Of the brain, only `brain search` is allowed in a turn (bare program name); writing goes through the service path brain.notiz')
+            for wort in rest[1:]:
+                self.zugriff(wort, varmap, cwd, 'lesen')
+            return cwd
+        mail = name not in funktionen and name in mail_werkzeuge(self.p.welt) and self.mail_senden(name, worte)
+        if name not in funktionen and not mail:
+            self.muster(text, voll)
+            if name == 'git':
+                self.git(stage[:idx], worte)
+        schreibend = name in MUTIERENDE or (name in MIT_I_OPTION and any(w.startswith('-i') for w in worte))
+        positionen = [w for w in rest if not (w.startswith('-') and not (w.startswith('--') and '=' in w))]
+        for n, wort in enumerate(positionen):
+            art = 'schreiben' if schreibend else 'lesen'
+            if name in QUELLE_ZIEL and n < len(positionen) - 1:
+                art = 'lesen'
+            self.zugriff(wort, varmap, cwd, art)
+        return cwd
+
+
+    def mail_senden(self, werkzeug, worte):
+        """True fuer `<werkzeug> senden ...` mit gueltiger Freigabe email fuer dieses Werkzeug (dann ersetzt sie das
+        Muster); ohne Freigabe Verweigert. Andere Unterbefehle (lesen) laufen weiter ueber die Bash-Muster."""
+        unter = next((w for w in worte if not w.startswith('-')), None)
+        if unter != 'senden':
+            return False
+        adressen = mail_freigabe(self.p.welt, self.p.agent, werkzeug=werkzeug)
+        if not adressen:
+            raise Verweigert("'%s senden' needs an email approval in the world's freigaben.json; the human gives it with 'wb-welt freigabe <welt> erteilen --art email ...', the main agent passes its own on to you with freigabe.weitergeben" % werkzeug)
+        for i, wort in enumerate(worte):
+            von = worte[i + 1] if wort == '--von' and i + 1 < len(worte) else (
+                wort.split('=', 1)[1] if wort.startswith('--von=') else None)
+            if von is not None and von.strip().lower() not in adressen:
+                raise Verweigert("sender '%s' is not in your email approval (allowed: %s)"
+                                 % (von, ', '.join(adressen)))
+        return True
+
+    def git(self, vorspann, worte):
+        """git im eigenen Worktree: Stufenregeln fuer merge, keine Umlenkung von Konfiguration und Umgebung."""
+        if any(t in UMGEBUNG_LEEREN or t.startswith(('--unset=', '-u')) for t in vorspann if t.startswith('-')):
+            raise Verweigert('git runs only with the environment of the turn (no env -i, env -u or exec -c before it)')
+        i = 0
+        while i < len(worte) and worte[i].startswith('-'):
+            if worte[i].split('=', 1)[0] in GIT_GLOBAL_GESPERRT or worte[i].startswith('-c'):
+                raise Verweigert("git option '%s' redirects configuration or repository and is locked in a turn" % worte[i])
+            i += 1 + (worte[i] == '-C')
+        if i >= len(worte):
+            return
+        befehl, args = worte[i], worte[i + 1:]
+        if befehl == 'worktree':
+            raise Verweigert('git worktree belongs to the carrier; every agent has exactly its own worktree')
+        if befehl == 'switch' or (befehl == 'checkout' and args[:1] != ['--']):
+            raise Verweigert("No switch to other branches: the agent stays on agent/%s; 'git checkout -- <paths>' restores files" % self.p.agent)
+        if befehl == 'merge':
+            self.git_merge(args)
+        elif befehl == 'rebase':
+            self.git_rebase(args)
+
+    def git_merge(self, args):
+        if self.p.stufe not in ('teamleiter', 'hauptagent'):
+            raise Verweigert('Merging is done only by a team lead or the main agent')
+        ziele, i = [], 0
+        while i < len(args):
+            wort = args[i]
+            if wort in MERGE_MIT_WERT:
+                i += 2
+                continue
+            if wort in ('-s', '--strategy') or wort.startswith('--strategy='):
+                raise Verweigert('git merge with a custom strategy is locked in a turn')
+            if not wort.startswith('-'):
+                ziele.append(wort)
+            i += 1
+        if not ziele and not any(w in ('--abort', '--continue', '--quit') for w in args):
+            raise Verweigert('git merge nennt keinen Agentenzweig agent/<id>')
+        for ziel in ziele:
+            treffer = AGENTENZWEIG_RE.match(ziel)
+            if treffer is None:
+                raise Verweigert("git merge only merges agent branches (agent/<id>), not '%s'" % ziel)
+            if self.p.stufe == 'teamleiter' and treffer.group(1) != self.p.agent:
+                anderer = _agent_profil(self.p.welt, treffer.group(1))
+                if anderer is None or anderer.get('stage') != 'mitglied' or not self.p.team \
+                        or anderer.get('team') != self.p.team:
+                    raise Verweigert("'%s' belongs to no member of team '%s'; team leads merge only branches of their team" % (ziel, self.p.team))
+
+    def git_rebase(self, args):
+        positionen, i = [], 0
+        while i < len(args):
+            wort = args[i]
+            if wort == '--onto':
+                i += 2
+                continue
+            if wort.startswith('-'):
+                if wort not in REBASE_OPTIONEN and not wort.startswith(('--onto=', '--empty=')):
+                    raise Verweigert("git rebase '%s' is locked in a turn (no --exec, no -i)" % wort)
+            else:
+                positionen.append(wort)
+            i += 1
+        if len(positionen) > 1:
+            raise Verweigert('git rebase with a second branch switches the working tree; the agent stays on agent/%s' % self.p.agent)
+
+    def zugang_treffer(self, text, voll):
+        for zugang, muster in sorted(self.p.zugaenge.items()):
+            if any(muster_passt(text, m) or muster_passt(voll, m) for m in muster):
+                return zugang
+        return None
+
+    def zugang(self, zugang, name, stage, idx, rest, varmap, cwd):
+        """Ein Befehl ueber einen Zugang: nackter Programmname ohne Vorspann, feste Argumente, kein fremdes Ziel,
+        nur harmlose Optionen; lokale Pfade von scp und rsync pruefen Welt- und Schreibgrenze."""
+        if stage[idx] != name or any(t not in cs.BLOCK_KEYWORDS for t in stage[:idx]):
+            raise Verweigert("'%s' through an access runs only as a bare '%s ...' without path, wrapper or assignment before it" % (' '.join(stage), name))
+        for wort in rest:
+            if '$' in wort or '`' in wort:
+                raise Verweigert("'%s' through an access needs fixed arguments without variables or substitution"
+                                 % ' '.join(stage))
+        worte = list(rest)  # die Zerlegung hat Anfuehrungen schon entfernt
+        if name == 'ssh':
+            if not worte or worte[0] != zugang:
+                raise Verweigert("ssh ueber einen Zugang beginnt mit dem Zugangsnamen: 'ssh %s <befehl>'" % zugang)
+            if len(worte) < 2:
+                raise Verweigert('ssh %s needs a command; there is no open session' % zugang)
+            if worte[1].startswith('-'):
+                raise Verweigert('ssh %s: after the access name comes the remote command, not an ssh option' % zugang)
+            # Der entfernte Befehl ist nicht an die Bash-Muster gebunden (der Server ist der freigegebene Bereich),
+            # die Hausliste gilt aber auch dort: jede erkennbare Stufe und jedes gesperrte Textmuster.
+            entfernt = ' '.join(worte[1:])
+            self.hausliste_text(entfernt)
+            for stmt in cs.all_statements(entfernt):
+                for teil in cs.split_pipeline(stmt or []):
+                    programm, i, weiter = cs.resolve_command(teil, {})
+                    if programm is not None and programm not in (cs.SUBSHELL_TOKEN, cs.PROCSUB_TOKEN):
+                        self.hausliste_stufe(teil[i], list(weiter))
+            return
+        positionen = []
+        for wort in worte:
+            if name == 'scp' and wort.startswith('-'):
+                if wort == '-' or not set(wort[1:]) <= SCP_BUCHSTABEN:
+                    raise Verweigert("scp option '%s' is locked through an access (allowed: -r -p -q -C -v -3 -4 -6)"
+                                     % wort)
+                continue
+            if name == 'rsync' and wort.startswith('--'):
+                if wort not in RSYNC_LANG and not wort.startswith(RSYNC_LANG_WERT):
+                    raise Verweigert("rsync option '%s' is locked through an access" % wort)
+                continue
+            if name == 'rsync' and wort.startswith('-'):
+                if wort == '-' or not set(wort[1:]) <= RSYNC_BUCHSTABEN:
+                    raise Verweigert("rsync option '%s' is locked through an access (no -e, no shell)" % wort)
+                continue
+            positionen.append(wort)
+        if len(positionen) < 2:
+            raise Verweigert('%s through an access needs a source and a target' % name)
+        entfernt = 0
+        for n, wort in enumerate(positionen):
+            kopf, trenner, _ = wort.partition(':')
+            if trenner and '/' not in kopf:
+                if kopf != zugang:
+                    raise Verweigert("'%s' nennt ein anderes Ziel als den Zugang '%s'" % (wort, zugang))
+                entfernt += 1
+                continue
+            art = 'schreiben' if n == len(positionen) - 1 else 'lesen'
+            self.zugriff(wort, varmap, cwd, art, immer=True)
+        if not entfernt:
+            raise Verweigert("%s ueber den Zugang '%s' braucht ein Ziel '%s:<pfad>'" % (name, zugang, zugang))
+
+
+def _git_umgebung_pruefen(tokens):
+    """GIT_*-Variablen kommen aus der Einstellungsdatei des Zuges (Hooks aus, Identitaet); kein Befehl aendert sie."""
+    for token in tokens:
+        if GIT_UMGEBUNG_RE.match(token):
+            raise Verweigert("'%s' aendert eine GIT_*-Variable des Zuges" % token)
+
+
+def _agent_profil(welt, agent):
+    """agent.json eines anderen Agenten derselben Welt, None wenn nicht lesbar."""
+    pfad = os.path.join(welt, 'agents', agent, 'agent.json')
+    if not ID_RE.fullmatch(agent) or os.path.islink(os.path.join(welt, 'agents', agent)):
+        return None
+    try:
+        daten = json.loads(_datei_lesen(pfad, PROFIL_LIMIT).decode('utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return daten if isinstance(daten, dict) else None
+
+
+def _unbestimmt(wort, varmap):
+    """Ob das Wort eine Variable nennt, die weder der Befehl zuweist noch die Umgebung kennt
+    (Schleifen- und Leseziele, Positionsparameter)."""
+    if SONDERVARIABLE_RE.search(wort):
+        return True
+    return any((m.group(1) or m.group(2)) not in varmap and (m.group(1) or m.group(2)) not in os.environ
+               for m in VARIABLE_RE.finditer(wort))
+
+
+def _eingaben(tokens):
+    ziele, i = [], 0
+    while i < len(tokens):
+        m = re.match(r'^(?:[0-9]+)?<(?![<&>(])(.*)$', tokens[i])
+        if m:
+            if m.group(1):
+                ziele.append(m.group(1))
+            elif i + 1 < len(tokens):
+                ziele.append(tokens[i + 1])
+                i += 1
+        i += 1
+    return ziele
+
+
+# ------------------------------------------------------------- Logik ----
+def eingabe_lesen():
+    try:
+        roh = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    try:
+        daten = json.loads(roh) if roh.strip() else {}
+    except ValueError:
+        return {}
+    return daten if isinstance(daten, dict) else {}
+
+
+def entscheiden(eingabe):
+    """None = erlaubt, sonst Grund."""
+    werkzeug = eingabe.get('tool_name')
+    try:
+        profil = profil_laden()
+    except Verweigert as exc:
+        return str(exc)
+    if profil is None:
+        return None
+    if not isinstance(werkzeug, str) or WERKZEUG_ALIAS.get(werkzeug, werkzeug) not in profil.tools:
+        return "tool '%s' is not in the tool list of agent '%s'" % (werkzeug, profil.agent)
+    felder = eingabe.get('tool_input') if isinstance(eingabe.get('tool_input'), dict) else {}
+    cwd = str(eingabe.get('cwd') or '') or os.getcwd()
+    pruefung = Pruefung(profil)
+    try:
+        if werkzeug == 'Bash':
+            befehl = felder.get('command')
+            if not isinstance(befehl, str) or not befehl.strip():
+                return None
+            profil.pfad(cwd, os.path.realpath(cwd), 'lesen')
+            if profil.zugaenge and PATH_RE.search(befehl):
+                return ('While accesses are provided, no command changes or names PATH -- ssh, scp and rsync run only through the wrappers of the turn')
+            pruefung.hausliste_text(befehl)
+            pruefung.bash(befehl, cwd)
+            return None
+        art = 'schreiben' if werkzeug in SCHREIBWERKZEUGE else 'lesen'
+        if werkzeug == 'Glob':
+            basis = felder.get('path') if isinstance(felder.get('path'), str) and felder.get('path') else cwd
+            muster = felder.get('pattern') if isinstance(felder.get('pattern'), str) else ''
+            ziel = muster if os.path.isabs(muster) else os.path.join(basis, muster)
+            ziel = re.split(r'[*?\[{]', ziel, 1)[0] or basis
+        elif werkzeug == 'Grep':
+            ziel = felder.get('path') if isinstance(felder.get('path'), str) and felder.get('path') else cwd
+        else:
+            ziel = felder.get('file_path') or felder.get('notebook_path')
+            if not isinstance(ziel, str) or not ziel.strip():
+                return None
+        # Werkzeugpfade sind woertlich: keine Shell-Variablen, keine Tilde.
+        profil.pfad(ziel, os.path.realpath(ziel if os.path.isabs(ziel) else os.path.join(cwd, ziel)), art)
+        return None
+    except Verweigert as exc:
+        return str(exc)
+
+
+def main():
+    alarm_setzen()
+    try:
+        grund = entscheiden(eingabe_lesen())
+    except Exception as exc:  # noqa: BLE001 - Sandbox-Zusage: eigener Fehler verweigert
+        grund = 'internal error of the check (%s) -- without a check nothing is allowed' % type(exc).__name__
+    if grund:
+        print_deny(grund)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

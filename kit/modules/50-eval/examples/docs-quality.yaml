@@ -1,0 +1,82 @@
+# Documentation quality of generated docstrings, scored by a rubric-based LLM judge.
+# Needs an OpenAI-compatible endpoint (default: local Ollama at http://localhost:11434/v1).
+#   evalkit run examples/docs-quality.yaml --dry-run          # check the suite offline
+#   EVALKIT_MODEL=llama3.2 evalkit run examples/docs-quality.yaml
+# To test a CLI agent instead, enable the `cli-agent` provider and adapt its command.
+name: docstring-quality
+description: Does the model write accurate, useful docstrings for small functions?
+repetitions: 3
+timeout: 180
+
+prompt: |
+  Write a docstring for the function below. Reply with the docstring text only,
+  no code and no explanation.
+
+  {input}
+
+providers:
+  - id: llm
+    type: openai
+    base_url: "${EVALKIT_BASE_URL:-http://localhost:11434/v1}"
+    model: "${EVALKIT_MODEL:-llama3.2}"
+    # api_key_env: OPENAI_API_KEY   # name of the env var holding the key, never the key itself
+    temperature: 0.2
+  - id: cli-agent
+    type: shell
+    default: false            # only runs when selected with -p cli-agent
+    command: "claude -p {input}"   # any CLI that prints an answer: codex exec, ollama run <model>, ...
+
+judges:
+  - id: judge
+    type: openai
+    base_url: "${EVALKIT_JUDGE_BASE_URL:-http://localhost:11434/v1}"
+    model: "${EVALKIT_JUDGE_MODEL:-llama3.2}"
+    temperature: 0
+
+cases:
+  - id: retry-decorator
+    input: |
+      def retry(times, delay=1.0):
+          def wrap(fn):
+              def inner(*args, **kwargs):
+                  for attempt in range(times):
+                      try:
+                          return fn(*args, **kwargs)
+                      except Exception:
+                          if attempt == times - 1:
+                              raise
+                          time.sleep(delay)
+              return inner
+          return wrap
+    graders:
+      - {type: regex, pattern: "(?i)retr", flags: i}
+      - type: llm-judge
+        rubric: |
+          The docstring must (1) say the decorated function is retried on any exception,
+          (2) explain both parameters, times and delay, and (3) state that the last exception
+          is re-raised. It must not claim behaviour the code does not have.
+  - id: parse-duration
+    input: |
+      def parse_duration(text: str) -> int:
+          units = {"s": 1, "m": 60, "h": 3600}
+          value, unit = int(text[:-1]), text[-1]
+          return value * units[unit]
+    graders:
+      - {type: contains, value: ["seconds"], ignore_case: true}
+      - type: llm-judge
+        rubric: |
+          The docstring must say the result is in seconds, give at least one example input such as
+          "5m", and mention that an unknown unit or a malformed value raises an error.
+  - id: slugify
+    input: |
+      def slugify(title):
+          out = []
+          for ch in title.lower():
+              out.append(ch if ch.isalnum() else "-")
+          return "-".join(p for p in "".join(out).split("-") if p)
+    graders:
+      - {type: contains, value: "TODO", negate: true}
+      - type: llm-judge
+        rubric: |
+          The docstring must describe that the title is lower-cased and that runs of characters
+          which are not letters or digits become a single hyphen, with no leading or trailing hyphen.

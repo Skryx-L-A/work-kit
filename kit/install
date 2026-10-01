@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# work-kit installer: menu for all modules under kit/modules. See kit/README.md.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+HERE="$(cd -P "$(dirname "$SELF")" && pwd)"
+
+# The menu is Python. A fresh laptop may lack python3, so fall back to the kit's own CPython:
+# first one installed by 00-python (uv), then a bootstrap copy unpacked from kit/offline/python.
+usable() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; }
+PY=""
+if command -v python3 >/dev/null 2>&1 && usable python3; then
+  PY=python3
+else
+  for c in "$HOME"/.local/share/uv/python/cpython-3.12*/bin/python3 \
+           "${KIT_DATA_DIR:-$HOME/.local/share/work-kit}"/bootstrap-python/python/bin/python3; do
+    if [ -x "$c" ] && usable "$c"; then PY="$c"; break; fi
+  done
+fi
+if [ -z "$PY" ]; then
+  archive="$(find "$HERE/offline/python" -name 'cpython-3.12*-x86_64-unknown-linux-gnu-install_only*.tar.gz' 2>/dev/null | sort | head -n1 || true)"
+  if [ "$(uname -s)/$(uname -m)" = "Linux/x86_64" ] && [ -n "$archive" ]; then
+    dest="${KIT_DATA_DIR:-$HOME/.local/share/work-kit}/bootstrap-python"
+    echo "install: no usable python3 on this system, unpacking the kit's CPython to $dest"
+    rm -rf "$dest" && mkdir -p "$dest"
+    tar -xzf "$archive" -C "$dest"
+    PY="$dest/python/bin/python3"
+    usable "$PY" || { echo "install: bootstrap CPython does not run" >&2; exit 1; }
+  else
+    echo "install: python3 not found and no kit CPython for this system in $HERE/offline/python" >&2
+    exit 1
+  fi
+fi
+PYTHONDONTWRITEBYTECODE=1 exec "$PY" "$HERE/lib/installer/installer.py" --kit-dir "$HERE" "$@"

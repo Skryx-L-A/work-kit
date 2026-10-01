@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Global git hook dispatcher (core.hooksPath = ~/.claude/git-hooks).
+#
+# der Nutzer, 25.09.2026: "nur mich als Autor, keine Coautoren -- nicht nur von
+# Claude, auch von allen anderen Modellen und Harnesses, niemals". Claude Code is
+# switched off in settings.json (attribution), but aider, opencode, Codex, pi and
+# any future harness can still append trailers. The only place every one of them
+# passes is git itself, so commit-msg removes every Co-authored-by line here.
+#
+# A global core.hooksPath makes git ignore the repository's own .git/hooks. So
+# every hook name is a symlink to this file, which runs the repository's own
+# hook of the same name afterwards -- the kbase's note lint (pre-commit) and the
+# brain sync hooks (post-commit, post-merge, pre-push, post-checkout) keep working.
+# A repository with its OWN core.hooksPath (husky and friends) never reaches this
+# file; the local setting wins over the global one.
+name="$(basename "$0")"
+name="${name%.work-kit-chained}"   # kit: also installed as <hook>.work-kit-chained behind 40-data-guard
+
+if [ "$name" = commit-msg ] && [ -n "${1:-}" ] && [ -f "$1" ]; then
+  perl -ni -e 'print unless /^\s*co-authored-by\s*:/i' "$1"
+fi
+
+common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+lokal="$common/hooks/$name"
+if [ -x "$lokal" ]; then
+  # Never call ourselves again (a repository that symlinked its hooks here).
+  selbst="$(cd "$(dirname "$0")" && pwd -P)/$name"
+  ziel="$(cd "$(dirname "$lokal")" && pwd -P)/$(basename "$lokal")"
+  [ "$ziel" = "$selbst" ] && exit 0
+else
+  lokal=""
+fi
+
+# A global core.hooksPath suppresses the hooks that git lfs install would create in
+# .git/hooks. Invoke LFS only when there is no repository hook to preserve. This
+# runs before the final exec, so pre-push receives the original stdin.
+uses_lfs() {
+  local top line
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  if [ -f "$top/.gitattributes" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *filter=lfs*) return 0 ;; esac
+    done <"$top/.gitattributes"
+  fi
+  git config --local --get lfs.repositoryformatversion >/dev/null 2>&1 && return 0
+  git config --local --get-regexp '^filter\.lfs\.' >/dev/null 2>&1 && return 0
+  return 1
+}
+
+case "$name" in
+  pre-push|post-checkout|post-commit|post-merge)
+    if [ -z "$lokal" ] && uses_lfs; then
+      if command -v git-lfs >/dev/null 2>&1; then
+        git lfs "$name" "$@" || exit $?
+      else
+        echo "git-hooks: WARNING: repository uses Git LFS but git-lfs is not on PATH; skipping $name" >&2
+      fi
+    fi
+    ;;
+esac
+
+if [ -n "$lokal" ]; then
+  exec "$lokal" "$@"
+fi
+exit 0

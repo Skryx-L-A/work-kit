@@ -1,0 +1,70 @@
+/* kit-design HTML deck: fixed 1280x720 slides scaled to the window; one slide per page in print. */
+:root {
+/*TOKENS*/
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #111; }
+body { font-family: var(--font-body); color: var(--text); overflow: hidden; }
+.deck { position: absolute; top: 50%; left: 50%; width: 1280px; height: 720px; transform-origin: center; }
+.slide {
+  position: absolute; inset: 0; background: var(--bg); padding: 56px 72px 64px;
+  display: none; flex-direction: column; overflow: hidden;
+}
+.slide.active { display: flex; }
+.slide h1 {
+  font-family: var(--font-heading); font-size: 40px; line-height: 1.12; margin: 0 0 28px;
+  max-width: 1040px; font-weight: 700; letter-spacing: -0.01em;
+}
+.slide h1::before {
+  content: ""; display: block; width: 58px; height: 7px; background: var(--accent); margin-bottom: 18px;
+}
+.body { flex: 1; min-height: 0; display: flex; gap: 40px; font-size: 28px; line-height: 1.35; }
+.body > .col { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.body p { margin: 0 0 14px; }
+.body ul { margin: 0; padding-left: 1.1em; }
+.body li { margin: 0 0 12px; }
+.body li::marker { color: var(--accent); }
+.body li.l1 { font-size: 0.85em; margin-left: 1.1em; list-style-type: "\2013  "; }
+.body code { font-family: ui-monospace, "DejaVu Sans Mono", Menlo, monospace; font-size: 0.9em; background: var(--surface); padding: 0 6px; border-radius: 4px; }
+figure { margin: 0; flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+figure img { flex: 1; min-height: 0; max-width: 100%; width: 100%; object-fit: contain; }
+figcaption { color: var(--muted); font-size: 16px; margin-top: 10px; }
+.footer {
+  position: absolute; left: 72px; right: 72px; bottom: 26px; display: flex; justify-content: space-between;
+  color: var(--muted); font-size: 14px;
+}
+.logo { position: absolute; top: 34px; right: 72px; height: 38px; }
+
+.layout-title { padding-left: 128px; justify-content: center; }
+.layout-title::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 26px; background: var(--accent); }
+.layout-title h1 { font-size: 60px; max-width: 1000px; margin-bottom: 30px; }
+.layout-title h1::before { display: none; }
+.layout-title .body { flex: 0; color: var(--muted); font-size: 30px; }
+.layout-title .byline { position: absolute; left: 128px; bottom: 64px; color: var(--muted); font-size: 20px; }
+.layout-title .logo { top: 56px; height: 56px; }
+
+.layout-section { background: var(--accent); color: var(--bg); padding-left: 112px; justify-content: center; }
+.layout-section h1 { font-size: 56px; }
+.layout-section h1::before { background: var(--bg); }
+.layout-section .body { flex: 0; opacity: 0.9; }
+
+.layout-big-number .number { font-family: var(--font-heading); font-size: 150px; font-weight: 700; color: var(--accent); line-height: 1; margin: 20px 0 22px; }
+.layout-big-number .body { flex-direction: column; gap: 0; color: var(--muted); font-size: 32px; }
+
+.layout-quote { justify-content: center; padding-left: 140px; }
+.layout-quote blockquote { margin: 0; border-left: 8px solid var(--accent); padding-left: 40px; font-family: var(--font-heading); font-size: 46px; line-height: 1.25; }
+.layout-quote .attribution { color: var(--muted); font-size: 24px; margin: 26px 0 0 48px; }
+
+.notes { display: none; }
+body.show-notes .slide.active .notes {
+  display: block; position: absolute; left: 0; right: 0; bottom: 0; max-height: 40%; overflow: auto;
+  background: rgba(0, 0, 0, 0.85); color: #fff; font-size: 18px; padding: 16px 24px; white-space: pre-wrap;
+}
+
+@media print {
+  @page { size: 1280px 720px; margin: 0; }
+  html, body { background: none; overflow: visible; height: auto; }
+  .deck { position: static; transform: none !important; width: auto; height: auto; }
+  .slide { position: relative; display: flex !important; width: 1280px; height: 720px; break-after: page; }
+  .notes { display: none !important; }
+}

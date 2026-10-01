@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""kit-context: context for an agent session, from the kit brain and the project.
+
+  kit-context session [--cwd DIR] [--format text|json] [--with-role]
+                                                            project KERN.md + role line (the full
+                                                            role prompt with --with-role, or when
+                                                            KIT_AGENT_ROLE differs from profiles.conf)
+  kit-context prompt  [--cwd DIR] [--format text|json] [TEXT]
+                                                            brain search on the prompt (TEXT, or
+                                                            read from stdin, raw or hook JSON)
+
+`kit-context hook <harness> session|prompt [--with-role]` reads the harness's hook JSON on stdin and prints the
+harness's output shape (see HOOK_OUT). Silent (exit 0, no output) when there is nothing to add,
+when brain is not installed, or on any error: context hooks must never block a session.
+Settings (~/.config/work-kit/profiles.conf): recall=on|off, recall.k=5, kern=on|off.
+"""
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "guard" / "lib"))
+try:
+    from checks import current_role, read_kv, config_dir, redact  # noqa: E402
+except Exception:  # the context hook must work even if the guard files are missing
+    def current_role(harness=""):
+        return os.environ.get("KIT_AGENT_ROLE", "lead")
+
+    def config_dir():
+        return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "work-kit"
+
+    def read_kv(path):
+        return {}
+
+    def redact(text):
+        return text, 0
+
+MAX_KERN_CHARS = 4000
+MAX_RECALL_CHARS = 2500
+MIN_PROMPT_CHARS = 12
+NO_BRAIN_MARKER = ".wb-ohne-brain"
+RECALL_BUDGET_SECONDS = 3.0
+RECALL_CACHE_SECONDS = 60.0
+
+
+def settings() -> dict:
+    return read_kv(config_dir() / "profiles.conf")
+
+
+def brain_home() -> Path:
+    return Path(os.environ.get("BRAIN_HOME") or Path.home() / "work" / "brain")
+
+
+def git_top(cwd: str) -> Path | None:
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                           timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def without_brain(cwd: str) -> bool:
+    """Honor a project opt-out marker from cwd up to, but not including, HOME."""
+    try:
+        current = Path(cwd).resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return False
+    while current != current.parent and current != home:
+        if (current / NO_BRAIN_MARKER).exists():
+            return True
+        current = current.parent
+    return False
+
+
+def recall_cache_path(query: str) -> Path:
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "work-kit"
+    key = hashlib.sha256((str(brain_home()) + "\0" + query).encode("utf-8")).hexdigest()
+    return cache_root / ("context-recall-" + key + ".json")
+
+
+def cached_recall(query: str) -> str:
+    try:
+        data = json.loads(recall_cache_path(query).read_text(encoding="utf-8"))
+        if data.get("expires", 0) > time.time() and isinstance(data.get("text"), str):
+            return data["text"]
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
+def cache_recall(query: str, text: str) -> None:
+    try:
+        path = recall_cache_path(query)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"expires": time.time() + RECALL_CACHE_SECONDS, "text": text}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def find_kern(cwd: str) -> Path | None:
+    """Project KERN.md: in the repository root, else brain projects/<repo-name>/KERN.md."""
+    top = git_top(cwd) or Path(cwd)
+    for cand in (top / "KERN.md", brain_home() / "projects" / slug(top.name) / "KERN.md"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def role_prompt(role: str) -> str:
+    """Rendered role file of the installed copy (roles/<role>.md next to context/)."""
+    f = Path(__file__).resolve().parent.parent / "roles" / ("%s.md" % role)
+    if not f.is_file():
+        return ""
+    text = f.read_text(encoding="utf-8", errors="replace")
+    # the repository copy still has variant blocks: keep the "none" variant
+    text = re.sub(r"<!-- variant:(\w+) -->\n(.*?)<!-- /variant -->\n",
+                  lambda m: m.group(2) if m.group(1) == "none" else "", text, flags=re.S)
+    return text.strip()
+
+
+def session_text(cwd: str, harness: str, with_role: bool = False) -> str:
+    parts = []
+    role = current_role(harness)
+    configured = (read_kv(config_dir() / "profiles.conf").get("role") or "lead").lower()
+    if role in ("lead", "worker"):
+        # with_role: harnesses whose only role channel is this hook. Otherwise the role sits in the
+        # system prompt already, unless KIT_AGENT_ROLE switched it for this session.
+        if with_role or role != configured:
+            text = role_prompt(role)
+            if text:
+                note = "" if with_role else " It replaces the %s role of the harness settings." % configured
+                parts.append("Your role for this session (kit, KIT_AGENT_ROLE=%s).%s\n\n%s" % (role, note, text))
+        else:
+            parts.append("Kit role: %s." % role)
+    if not without_brain(cwd) and settings().get("kern", "on") != "off":
+        kern = find_kern(cwd)
+        if kern:
+            text = kern.read_text(encoding="utf-8", errors="replace")
+            if len(text) > MAX_KERN_CHARS:
+                text = text[:MAX_KERN_CHARS] + "\n[... truncated, read %s]" % kern
+            parts.append("Project KERN (%s): current decisions and known pitfalls.\n%s" % (kern, text.strip()))
+    return redact("\n\n".join(parts))[0]
+
+
+def is_machine_prompt(prompt: str) -> bool:
+    p = prompt.lstrip()
+    return (len(p) < MIN_PROMPT_CHARS or p.startswith(("/", "!", "<")) or p.startswith("[Protocol")
+            or p.upper() == p and len(p.split()) < 4)
+
+
+def recall_text(prompt: str, cwd: str) -> str:
+    conf = settings()
+    if without_brain(cwd) or conf.get("recall", "on") == "off" or is_machine_prompt(prompt):
+        return ""
+    query = " ".join(prompt.split())[:500]
+    brain = shutil.which("brain")
+    if not brain:
+        return ""
+    cached = cached_recall(query)
+    if cached:
+        return cached
+    try:
+        k = int(conf.get("recall.k", "5"))
+    except ValueError:
+        k = 5
+    deadline = time.monotonic() + RECALL_BUDGET_SECONDS
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        # Prompt recall favors a bounded FTS result over a cold embedding-model startup.
+        r = subprocess.run([brain, "search", query, "-k", str(k), "--json", "--mode", "bm25"],
+                           capture_output=True, text=True, timeout=remaining)
+        res = json.loads(r.stdout) if r.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return ""
+    rows = []
+    for it in res.get("results", []):
+        where = it.get("path", "")
+        if it.get("heading"):
+            where += " > " + it["heading"]
+        snip = " ".join(str(it.get("snippet") or "").split())[:180]
+        rows.append("- %s (%s): %s" % (it.get("title") or where, where, snip))
+    if not rows:
+        return ""
+    text = ("Brain recall (automatic, unverified; ignore what does not fit, read a note with "
+            "`brain read <path>`):\n" + "\n".join(rows))
+    if time.monotonic() >= deadline:
+        return ""
+    text = redact(text[:MAX_RECALL_CHARS])[0]
+    cache_recall(query, text)
+    return text
+
+
+# --- hook I/O per harness -------------------------------------------------------------------
+
+def hook_prompt(data: dict) -> str:
+    for key in ("prompt", "user_prompt", "userPrompt", "message", "text"):
+        v = data.get(key)
+        if isinstance(v, str):
+            return v
+    llm = data.get("llm_request")
+    if isinstance(llm, dict):  # Gemini BeforeAgent carries the prompt here in some versions
+        msgs = llm.get("messages") or []
+        if msgs and isinstance(msgs[-1], dict):
+            return str(msgs[-1].get("content") or "")
+    return ""
+
+
+def hook_out(harness: str, event: str, text: str) -> str:
+    if not text:
+        return ""
+    if harness == "claude":
+        name = "SessionStart" if event == "session" else "UserPromptSubmit"
+        return json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}})
+    if harness == "gemini":
+        name = "SessionStart" if event == "session" else "BeforeAgent"
+        return json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}})
+    if harness == "codex":
+        name = "SessionStart" if event == "session" else "UserPromptSubmit"
+        return json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}})
+    if harness == "copilot":  # Copilot CLI reads the top-level key, VS Code the Claude-style one
+        name = "SessionStart" if event == "session" else "UserPromptSubmit"
+        return json.dumps({"additionalContext": text,
+                           "hookSpecificOutput": {"hookEventName": name, "additionalContext": text}})
+    if harness == "cursor":
+        return json.dumps({"additional_context": text})
+    return text
+
+
+def main(argv: list[str]) -> int:
+    fmt, cwd, args, with_role = "text", os.getcwd(), [], False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--cwd" and i + 1 < len(argv):
+            cwd = argv[i + 1]
+            i += 2
+            continue
+        if a == "--format" and i + 1 < len(argv):
+            fmt = argv[i + 1]
+            i += 2
+            continue
+        if a == "--with-role":
+            with_role = True
+            i += 1
+            continue
+        args.append(a)
+        i += 1
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    try:
+        if args[0] == "hook" and len(args) >= 3:
+            harness, event = args[1], args[2]
+            raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                data = {}
+            hcwd = data.get("cwd") or (data.get("workspace_roots") or [None])[0] or cwd
+            text = session_text(hcwd, harness, with_role) if event == "session" else recall_text(hook_prompt(data), hcwd)
+            out = hook_out(harness, event, text)
+            if out:
+                print(out)
+            return 0
+        if args[0] == "session":
+            text = session_text(cwd, "", with_role)
+        elif args[0] == "prompt":
+            prompt = " ".join(args[1:]) if len(args) > 1 else sys.stdin.read()
+            try:
+                d = json.loads(prompt)
+                if isinstance(d, dict):
+                    prompt = hook_prompt(d)
+            except ValueError:
+                pass
+            text = recall_text(prompt, cwd)
+        else:
+            print("kit-context: unknown command %r (session, prompt, hook)" % args[0], file=sys.stderr)
+            return 2
+        if text:
+            print(json.dumps({"context": text}) if fmt == "json" else text)
+    except Exception as e:  # never break a session
+        print("kit-context: %s" % e, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

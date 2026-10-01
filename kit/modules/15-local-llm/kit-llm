@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# kit-llm: run a local GGUF model on the CPU with llama.cpp's llama-server and expose it as an
+# OpenAI-compatible endpoint on 127.0.0.1. One server at a time. No network, no sudo.
+#
+# Usage: kit-llm <command> [options]
+#   models                     list catalog models, installed files and whether they fit in RAM
+#   start [MODEL] [options]    start the server (MODEL = catalog id or path to a .gguf file)
+#       --port N  --ctx N  --threads N  --force (skip the RAM guard)  --timeout S
+#   stop                       stop the server started by kit-llm
+#   status [--json]            running? which model, port, endpoint health
+#   ask "PROMPT"               one chat request to the running server, prints the answer
+#   env                        print shell exports that point OpenAI-compatible tools here
+#   logs [-n N]                tail the server log
+#   doctor                     check CPU (AVX2), engine, shared libraries, models, port
+#
+# Settings (environment or ~/.config/work-kit/local-llm.conf as KEY=value lines):
+#   KIT_LLM_MODEL (default qwen3.5-4b), KIT_LLM_PORT (8080), KIT_LLM_CTX (16384: enough for agent harnesses such as pi),
+#   KIT_LLM_THREADS (engine default), KIT_LLM_GPU_LAYERS (0 = CPU only),
+#   KIT_LLM_RESERVE_MB (1024, RAM kept free for the desktop), KIT_LLM_SERVER (engine binary).
+set -euo pipefail
+
+VERSION="1.0.0"
+DATA_DIR="${KIT_DATA_DIR:-$HOME/.local/share/work-kit}"
+LLM_HOME="${KIT_LLM_HOME:-$DATA_DIR/local-llm}"
+CONF_FILE="${KIT_LLM_CONF:-$HOME/.config/work-kit/local-llm.conf}"
+RUN_DIR="$LLM_HOME/run"
+PID_FILE="$RUN_DIR/server.pid"
+INFO_FILE="$RUN_DIR/server.info"
+LOG_FILE="$LLM_HOME/logs/server.log"
+HOST="127.0.0.1"
+
+say() { printf 'kit-llm: %s\n' "$*"; }
+warn() { printf 'kit-llm: WARNING: %s\n' "$*" >&2; }
+die() { printf 'kit-llm: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# --- settings -------------------------------------------------------------------------------
+# The config file is parsed, not sourced: only known keys with plain values are taken.
+load_conf() {
+  [ -f "$CONF_FILE" ] || return 0
+  local key val
+  while IFS='=' read -r key val; do
+    key="${key//[[:space:]]/}"
+    case "$key" in
+      KIT_LLM_MODEL|KIT_LLM_PORT|KIT_LLM_CTX|KIT_LLM_THREADS|KIT_LLM_GPU_LAYERS|KIT_LLM_RESERVE_MB|KIT_LLM_SERVER)
+        val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+        # environment wins over the file
+        [ -n "${!key:-}" ] || printf -v "$key" '%s' "$val" ;;
+    esac
+  done < <(grep -E '^[[:space:]]*KIT_LLM_[A-Z_]+=' "$CONF_FILE" || true)
+}
+load_conf
+MODEL_DEFAULT="${KIT_LLM_MODEL:-qwen3.5-4b}"
+PORT="${KIT_LLM_PORT:-8080}"
+CTX="${KIT_LLM_CTX:-16384}"
+THREADS="${KIT_LLM_THREADS:-}"
+GPU_LAYERS="${KIT_LLM_GPU_LAYERS:-0}"
+RESERVE_MB="${KIT_LLM_RESERVE_MB:-1024}"
+
+catalog() {
+  if [ -f "$LLM_HOME/models.conf" ]; then echo "$LLM_HOME/models.conf"
+  else echo "$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)/models.conf"; fi
+}
+
+# catalog_get <id> <field-number>: print one field of a catalog line.
+catalog_get() {
+  local cat; cat="$(catalog)"
+  [ -f "$cat" ] || return 1
+  awk -F'|' -v id="$1" -v n="$2" '$1 == id && $1 !~ /^#/ { print $n; found = 1 } END { exit !found }' "$cat"
+}
+
+server_bin() {
+  if [ -n "${KIT_LLM_SERVER:-}" ]; then echo "$KIT_LLM_SERVER"; return; fi
+  echo "$LLM_HOME/engine/current/llama-server"
+}
+
+file_bytes() { wc -c <"$1" | tr -d ' '; }
+
+# mem_available_mb: memory the system can give a new process without swapping.
+mem_available_mb() {
+  if [ -n "${KIT_LLM_MEM_AVAILABLE_MB:-}" ]; then echo "$KIT_LLM_MEM_AVAILABLE_MB"; return; fi
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024; exit }' /proc/meminfo
+  elif command -v vm_stat >/dev/null 2>&1; then
+    # macOS: free + inactive + speculative pages (development hosts only)
+    vm_stat | awk '/page size of/ { ps = $8 } /Pages free|Pages inactive|Pages speculative/ { gsub(/\./, "", $NF); n += $NF }
+      END { printf "%d\n", n * ps / 1048576 }'
+  else
+    echo 0
+  fi
+}
+
+# need_mb <model-bytes> <ctx>: model weights + KV cache estimate + runtime overhead.
+# KV estimate 0.12 MB per context token is an upper bound for the <= 4B catalog models
+# (e.g. 26 layers x 8 KV heads x 128 dims x 2 x f16 = 0.1 MB/token); see docs/local-llm.md.
+need_mb() { awk -v b="$1" -v c="$2" 'BEGIN { printf "%d\n", b / 1048576 + c * 0.12 + 300 }'; }
+
+# resolve_model <id|path>: sets MODEL_ID, MODEL_PATH, MODEL_ARGS.
+resolve_model() {
+  local m="$1" file
+  MODEL_ARGS=""
+  if [ -f "$m" ]; then
+    MODEL_PATH="$(cd "$(dirname "$m")" && pwd)/$(basename "$m")"
+    MODEL_ID="$(basename "$m" .gguf)"
+    return
+  fi
+  file="$(catalog_get "$m" 4)" || die "unknown model '$m' (kit-llm models lists them; a .gguf path also works)"
+  MODEL_ID="$m"
+  MODEL_PATH="$LLM_HOME/models/$file"
+  MODEL_ARGS="$(catalog_get "$m" 10 || true)"
+  [ -f "$MODEL_PATH" ] || die "model '$m' is not installed ($MODEL_PATH missing). Install it: bash <kit>/modules/15-local-llm/install.sh --models $m"
+}
+
+pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+running_pid() {
+  local pid
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if pid_alive "$pid"; then echo "$pid"; return 0; fi
+  rm -f "$PID_FILE" "$INFO_FILE"   # stale
+  return 1
+}
+
+info_get() { [ -f "$INFO_FILE" ] && awk -F'=' -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$INFO_FILE"; }
+
+http_get() { curl -fsS --max-time "${2:-3}" "$1" 2>/dev/null; }
+
+port_busy() { curl -s -o /dev/null --max-time 2 "http://$HOST:$1/" 2>/dev/null; }
+
+# --- commands -------------------------------------------------------------------------------
+cmd_models() {
+  local cat avail id file bytes lic params ship need fit inst
+  cat="$(catalog)"; [ -f "$cat" ] || die "no model catalog found ($cat)"
+  avail="$(mem_available_mb)"
+  printf '%-18s %-7s %-9s %-14s %-10s %s\n' ID PARAMS SIZE-MB "NEED-MB@${CTX}" INSTALLED "FITS (available ${avail} MB, reserve ${RESERVE_MB} MB)"
+  while IFS='|' read -r id _repo _rev file _sha bytes lic params ship _args; do
+    case "$id" in ''|'#'*) continue ;; esac
+    need="$(need_mb "$bytes" "$CTX")"
+    if [ -f "$LLM_HOME/models/$file" ]; then inst=yes; else inst=no; fi
+    if [ $((need + RESERVE_MB)) -le "$avail" ]; then fit=yes; else fit=no; fi
+    printf '%-18s %-7s %-9s %-14s %-10s %s\n' "$id" "$params" "$((bytes / 1048576))" "$need" "$inst" "$fit ($lic, $ship)"
+  done <"$cat"
+  echo "default model: $MODEL_DEFAULT, context: $CTX tokens"
+}
+
+cmd_start() {
+  local model="" force=0 timeout="${KIT_LLM_START_TIMEOUT:-120}" pid bin avail need bytes waited
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) PORT="${2:?}"; shift ;;
+      --ctx) CTX="${2:?}"; shift ;;
+      --threads) THREADS="${2:?}"; shift ;;
+      --timeout) timeout="${2:?}"; shift ;;
+      --force) force=1 ;;
+      -*) die "unknown option: $1" ;;
+      *) model="$1" ;;
+    esac
+    shift
+  done
+  model="${model:-$MODEL_DEFAULT}"
+  case "$PORT$CTX$timeout" in *[!0-9]*) die "--port, --ctx and --timeout take numbers" ;; esac
+
+  if pid="$(running_pid)"; then
+    say "already running: $(info_get model) on $(info_get url) (pid $pid). Use 'kit-llm stop' first to switch models."
+    [ "$(info_get model)" = "$model" ] && return 0
+    return 1
+  fi
+  resolve_model "$model"
+  bin="$(server_bin)"
+  [ -x "$bin" ] || die "engine not found: $bin (run the 15-local-llm install.sh, or set KIT_LLM_SERVER)"
+
+  bytes="$(file_bytes "$MODEL_PATH")"
+  need="$(need_mb "$bytes" "$CTX")"
+  avail="$(mem_available_mb)"
+  if [ $((need + RESERVE_MB)) -gt "$avail" ]; then
+    if [ "$force" = 1 ]; then
+      warn "RAM guard overridden: model needs ~${need} MB, available ${avail} MB (reserve ${RESERVE_MB} MB)"
+    else
+      die "not enough free memory for $MODEL_ID: needs ~${need} MB + ${RESERVE_MB} MB reserve, available ${avail} MB. Close programs, pick a smaller model (kit-llm models), lower --ctx, or --force."
+    fi
+  fi
+  if port_busy "$PORT"; then die "port $PORT on $HOST is already in use (choose --port N)"; fi
+
+  mkdir -p "$RUN_DIR" "$(dirname "$LOG_FILE")"
+  local args=(-m "$MODEL_PATH" --host "$HOST" --port "$PORT" -c "$CTX" -ngl "$GPU_LAYERS" --alias "$MODEL_ID")
+  [ -n "$THREADS" ] && args+=(-t "$THREADS")
+  if [ -n "$MODEL_ARGS" ]; then
+    # shellcheck disable=SC2206  # catalog args are plain words by contract
+    args+=($MODEL_ARGS)
+  fi
+  {
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') kit-llm $VERSION start $MODEL_ID"
+    echo "=== $bin ${args[*]}"
+  } >>"$LOG_FILE"
+  nohup "$bin" "${args[@]}" >>"$LOG_FILE" 2>&1 </dev/null &
+  pid=$!
+  echo "$pid" >"$PID_FILE"
+  {
+    echo "model=$MODEL_ID"
+    echo "path=$MODEL_PATH"
+    echo "port=$PORT"
+    echo "url=http://$HOST:$PORT/v1"
+    echo "ctx=$CTX"
+    echo "started=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  } >"$INFO_FILE"
+
+  say "starting $MODEL_ID (pid $pid, ~${need} MB) on http://$HOST:$PORT/v1 ..."
+  waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if ! pid_alive "$pid"; then
+      rm -f "$PID_FILE" "$INFO_FILE"
+      tail -n 15 "$LOG_FILE" >&2 || true
+      die "server exited during start (log: $LOG_FILE)"
+    fi
+    if http_get "http://$HOST:$PORT/health" >/dev/null; then
+      say "ready: $MODEL_ID at http://$HOST:$PORT/v1 (web chat: http://$HOST:$PORT/)"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "not ready after ${timeout}s; stopping it (log: $LOG_FILE)"
+  cmd_stop >/dev/null || true
+  return 1
+}
+
+cmd_stop() {
+  local pid _
+  if ! pid="$(running_pid)"; then say "not running"; return 0; fi
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    pid_alive "$pid" || break
+    sleep 0.2
+  done
+  if pid_alive "$pid"; then
+    warn "server did not stop within 10s; sending SIGKILL"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.5
+  fi
+  pid_alive "$pid" && die "could not stop pid $pid"
+  say "stopped $(info_get model) (pid $pid)"
+  rm -f "$PID_FILE" "$INFO_FILE"
+}
+
+cmd_status() {
+  local json=0 pid health=down url model
+  [ "${1:-}" = "--json" ] && json=1
+  if pid="$(running_pid)"; then
+    url="$(info_get url)"; model="$(info_get model)"
+    http_get "http://$HOST:$(info_get port)/health" >/dev/null && health=ok
+    if [ "$json" = 1 ]; then
+      printf '{"running": true, "pid": %s, "model": "%s", "url": "%s", "ctx": %s, "health": "%s", "started": "%s"}\n' \
+        "$pid" "$model" "$url" "$(info_get ctx)" "$health" "$(info_get started)"
+    else
+      say "running: $model (pid $pid) at $url, health $health, since $(info_get started)"
+    fi
+    [ "$health" = ok ]
+  else
+    if [ "$json" = 1 ]; then echo '{"running": false}'; else say "not running"; fi
+    return 3
+  fi
+}
+
+cmd_ask() {
+  local prompt="${1:-}" url
+  [ -n "$prompt" ] || { [ -t 0 ] && die "usage: kit-llm ask \"PROMPT\"  (or pipe text on stdin)"; prompt="$(cat)"; }
+  running_pid >/dev/null || die "not running (kit-llm start)"
+  url="$(info_get url)"
+  command -v python3 >/dev/null 2>&1 || die "python3 is needed for 'ask'; use curl: curl $url/chat/completions -d '{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
+  KIT_LLM_URL="$url" KIT_LLM_MODEL_ID="$(info_get model)" python3 - "$prompt" <<'PY'
+import json, os, sys, threading, time, urllib.request
+model = os.environ["KIT_LLM_MODEL_ID"]
+body = {"model": model, "messages": [{"role": "user", "content": sys.argv[1]}]}
+req = urllib.request.Request(os.environ["KIT_LLM_URL"] + "/chat/completions", json.dumps(body).encode(),
+                             {"Content-Type": "application/json"})
+
+# A CPU model can need minutes for the first token: say that we are waiting (stderr only,
+# so the answer on stdout stays clean). On a terminal the line counts seconds.
+done = threading.Event()
+start = time.time()
+tty = sys.stderr.isatty()
+print(f"kit-llm: waiting for {model} (a CPU answer can take minutes) ...", file=sys.stderr, flush=True)
+def ticker():
+    while not done.wait(1.0):
+        print(f"\rkit-llm: waiting for {model} ... {int(time.time() - start)}s", end="", file=sys.stderr, flush=True)
+if tty:
+    threading.Thread(target=ticker, daemon=True).start()
+try:
+    with urllib.request.urlopen(req, timeout=600) as r:
+        data = json.load(r)
+finally:
+    done.set()
+    if tty:
+        print("\r\033[K", end="", file=sys.stderr, flush=True)
+print(data["choices"][0]["message"].get("content", "").strip())
+u = data.get("usage") or {}
+t = data.get("timings") or {}
+extra = f", {t['predicted_per_second']:.1f} tok/s" if "predicted_per_second" in t else ""
+print(f"[{u.get('prompt_tokens')} in, {u.get('completion_tokens')} out{extra}, {time.time() - start:.0f}s]", file=sys.stderr)
+PY
+}
+
+cmd_env() {
+  local model port
+  model="$(info_get model 2>/dev/null || true)"; model="${model:-$MODEL_DEFAULT}"
+  port="$(info_get port 2>/dev/null || true)"; port="${port:-$PORT}"
+  echo "export OPENAI_BASE_URL=http://$HOST:$port/v1"
+  echo "export OPENAI_API_BASE=http://$HOST:$port/v1"
+  echo "export OPENAI_API_KEY=local-no-key"
+  echo "export KIT_LLM_BASE_URL=http://$HOST:$port/v1"
+  echo "export KIT_LLM_MODEL=$model"
+}
+
+cmd_logs() {
+  local n=40
+  [ "${1:-}" = "-n" ] && n="${2:-40}"
+  [ -f "$LOG_FILE" ] || die "no log yet ($LOG_FILE)"
+  tail -n "$n" "$LOG_FILE"
+}
+
+cmd_doctor() {
+  local bad=0 bin missing avail
+  if [ -r /proc/cpuinfo ]; then
+    if grep -qw avx2 /proc/cpuinfo; then say "ok   CPU has AVX2"
+    else say "WARN CPU without AVX2: llama.cpp falls back to slower SSE code"; fi
+  else
+    say "info no /proc/cpuinfo (not Linux); CPU check skipped"
+  fi
+  bin="$(server_bin)"
+  if [ -x "$bin" ]; then
+    say "ok   engine $bin"
+    if command -v ldd >/dev/null 2>&1; then
+      missing="$(ldd "$bin" 2>/dev/null | awk '/not found/ { print $1 }' | tr '\n' ' ')"
+      if [ -n "$missing" ]; then say "FAIL missing shared libraries: $missing"; bad=1
+      else say "ok   shared libraries resolve"; fi
+    fi
+    if "$bin" --version >/dev/null 2>&1; then say "ok   engine runs: $("$bin" --version 2>&1 | grep -m1 version || true)"
+    else say "FAIL engine does not run ($bin --version)"; bad=1; fi
+  else
+    say "FAIL engine missing: $bin"; bad=1
+  fi
+  local cat n=0 id file
+  cat="$(catalog)"
+  if [ -f "$cat" ]; then
+    while IFS='|' read -r id _r _v file _rest; do
+      case "$id" in ''|'#'*) continue ;; esac
+      [ -f "$LLM_HOME/models/$file" ] && n=$((n + 1))
+    done <"$cat"
+  fi
+  if [ "$n" -gt 0 ]; then say "ok   $n catalog model(s) installed"; else say "FAIL no model installed"; bad=1; fi
+  avail="$(mem_available_mb)"
+  say "info available memory ${avail} MB (reserve ${RESERVE_MB} MB)"
+  if [ -f "$cat" ]; then
+    local bytes need fit inst
+    while IFS='|' read -r id _r _v file _s bytes _rest; do
+      case "$id" in ''|'#'*) continue ;; esac
+      need="$(need_mb "$bytes" "$CTX")"
+      if [ $((need + RESERVE_MB)) -le "$avail" ]; then fit=fits; else fit="does NOT fit"; fi
+      if [ -f "$LLM_HOME/models/$file" ]; then inst=installed; else inst="not installed"; fi
+      say "info RAM need $id: ~${need} MB at ${CTX} tokens context + ${RESERVE_MB} MB reserve, $fit ($inst)"
+    done <"$cat"
+  fi
+  if running_pid >/dev/null; then say "ok   server running ($(info_get model))"
+  elif port_busy "$PORT"; then say "WARN port $PORT is used by another program"
+  else say "info server not running; port $PORT free"; fi
+  return "$bad"
+}
+
+# The header comment of this file is the help text (up to the first line that is not a comment).
+usage() { awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "${BASH_SOURCE[0]}"; }
+
+# Help first: "kit-llm <command> -h" must never run the command (ask would send "-h" to the model).
+for a in "$@"; do
+  case "$a" in -h|--help) usage; exit 0 ;; esac
+done
+
+case "${1:-}" in
+  models) shift; cmd_models "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  ask) shift; cmd_ask "$@" ;;
+  env) shift; cmd_env "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  --version|version) echo "kit-llm $VERSION" ;;
+  -h|--help|help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac

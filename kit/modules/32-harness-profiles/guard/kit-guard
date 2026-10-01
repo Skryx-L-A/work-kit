@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""kit-guard: one portable pre-tool guard for shell commands, for every harness.
+
+  kit-guard check [--cwd DIR] [--harness H] [--json] -- COMMAND
+        exit 0 allow, 2 deny (reason on stderr), 3 ask (reason on stderr); --json prints
+        {"decision": ..., "reason": ..., "check": ...} on stdout and exits 0
+  kit-guard hook <harness>      read the harness's pre-tool hook JSON on stdin, answer in its format
+  kit-guard post <harness>      post-tool hook: warn when shell output holds a secret-like string
+  kit-guard redact              stdin -> stdout with provider tokens replaced (used by the pi extension)
+  kit-guard policy [--harness H]
+        print the active role and policy
+
+Harnesses for `hook`: claude, codex, gemini, copilot, cursor. Checks and their order:
+guard/lib/checks.py. Settings: ~/.config/work-kit/guard.conf (commit=ask|allow|deny,
+commit.lead=, commit.worker=, disable=check,check, data-guard=PATH), exceptions for the content
+scan: ~/.config/work-kit/guard-exceptions.conf (one glob per line; a glob that matches a script's path
+or its name as typed also leaves that script out of the `script` check, which runs all checks over the
+local script a command starts: bash/sh/zsh x.sh, ./x.sh, source x.sh, bash < x.sh).
+Publishing (gh release create/upload/edit, gh repo create, gh pr merge, git push --force/-f/--delete, npm/pnpm/
+yarn/cargo/uv publish, twine upload, docker push, hf upload) is always an "ask"; after the human agreed the
+agent puts `KIT_PUBLISH_OK=1` in front of the command.
+A guard that cannot parse its input lets the call through (it cannot tell what would run); a
+guard that cannot finish a check it started refuses.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import checks  # noqa: E402
+
+SHELL_TOOLS = {
+    "claude": {"Bash"},
+    "codex": {"Bash", "shell", "exec_command", "local_shell"},
+    "gemini": {"run_shell_command"},
+    "copilot": {"bash", "shell", "powershell"},
+    "cursor": {"Shell", "shell"},
+}
+ASK_FALLBACK = "deny"  # for harnesses without a native "ask": the agent must ask the human in chat
+
+
+def extract(harness: str, data: dict) -> tuple[str, str] | None:
+    """(command, cwd) of a shell call, or None when the call is not a shell command."""
+    cwd = data.get("cwd") or (data.get("workspace_roots") or [""])[0] or os.getcwd()
+    if harness == "cursor" and "command" in data:  # beforeShellExecution
+        return str(data.get("command") or ""), cwd
+    name = data.get("tool_name") or data.get("toolName") or ""
+    ti = data.get("tool_input") or data.get("toolArgs") or data.get("tool_args") or data.get("input") or {}
+    if isinstance(ti, str):
+        try:
+            ti = json.loads(ti)
+        except ValueError:
+            ti = {"command": ti}
+    cmd = ti.get("command") if isinstance(ti, dict) else None
+    # VS Code names its terminal tool differently from the Copilot CLI: for copilot every tool with a
+    # string "command" argument counts as a shell call.
+    if name and name not in SHELL_TOOLS.get(harness, set()) and not (harness == "copilot" and isinstance(cmd, str)):
+        return None
+    if isinstance(cmd, list):  # codex exec style argv
+        cmd = " ".join(str(x) for x in cmd)
+    if not isinstance(cmd, str):
+        return None
+    return cmd, cwd
+
+
+def answer(harness: str, d: checks.Decision) -> tuple[str, int, str]:
+    """(stdout, exit code, stderr) in the harness's hook format."""
+    if d.decision == "allow":
+        return "", 0, ""
+    reason = "kit-guard (%s): %s" % (d.check, d.reason)
+    if harness == "claude":
+        return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": d.decision,
+                                                  "permissionDecisionReason": reason}}), 0, ""
+    if harness == "codex":
+        if d.decision == "ask":
+            reason += " Ask the human in chat; run the command only after an explicit yes."
+        return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                  "permissionDecisionReason": reason}}), 0, ""
+    if harness == "gemini":
+        if d.decision == "ask":
+            return json.dumps({"decision": "ask", "reason": reason}), 0, ""
+        return json.dumps({"decision": "deny", "reason": reason}), 0, ""
+    if harness == "copilot":  # top-level keys: Copilot CLI; hookSpecificOutput: VS Code agent hooks
+        return json.dumps({"permissionDecision": d.decision, "permissionDecisionReason": reason,
+                           "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": d.decision,
+                                                  "permissionDecisionReason": reason}}), 0, ""
+    if harness == "cursor":
+        return json.dumps({"permission": d.decision, "user_message": reason, "agent_message": reason}), 0, ""
+    return "", 2 if d.decision == "deny" else 3, reason
+
+
+def cmd_hook(harness: str) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        out, code, err = answer(harness, checks.Decision(
+            "deny", "hook input was not valid JSON. Refused rather than running unguarded.", "guard"))
+        if out:
+            print(out)
+        if err:
+            print(err, file=sys.stderr)
+        return code
+    if harness == "claude" and isinstance(data, dict) and data.get("tool_name") in ("Write", "Edit", "MultiEdit"):
+        ti = data.get("tool_input") or {}
+        path = ti.get("file_path") if isinstance(ti, dict) else None
+        found = checks.protected_config_path(path, data.get("cwd") or os.getcwd()) if isinstance(path, str) else None
+        if found:
+            print(answer(harness, checks.Decision("deny", "the human edits %s." % found, "guard-config"))[0])
+        return 0
+    got = extract(harness, data if isinstance(data, dict) else {})
+    if not got:
+        return 0
+    command, cwd = got
+    try:
+        d = checks.decide(command, cwd, checks.load_policy(harness))
+    except Exception as e:  # a check that crashed must not wave the command through
+        d = checks.Decision("deny", "internal error while checking the command (%s). Refused." % e, "guard")
+    out, code, err = answer(harness, d)
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return code
+
+
+def cmd_post(harness: str) -> int:
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return 0
+    resp = data.get("tool_response") or data.get("toolResult") or data.get("tool_output") or ""
+    text = resp if isinstance(resp, str) else json.dumps(resp)
+    hits = checks.find_secrets(text)
+    if not hits:
+        return 0
+    msg = ("kit-guard: the tool output contains a probable secret (%s). Do not repeat, store or send it; "
+           "tell the human which file or command exposed it." % hits[0])
+    if harness in ("claude", "codex", "gemini"):
+        event = "AfterTool" if harness == "gemini" else "PostToolUse"
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": msg}}))
+    else:
+        print(msg, file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = argv[0]
+    if cmd == "hook" and len(argv) >= 2:
+        return cmd_hook(argv[1])
+    if cmd == "post" and len(argv) >= 2:
+        return cmd_post(argv[1])
+    if cmd == "redact":
+        text, _ = checks.redact(sys.stdin.read())
+        sys.stdout.write(text)
+        return 0
+    if cmd in ("check", "policy"):
+        cwd, harness, as_json, rest = os.getcwd(), "", False, []
+        i = 1
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                rest.extend(argv[i + 1:])
+                break
+            if a == "--cwd" and i + 1 < len(argv):
+                cwd = argv[i + 1]
+                i += 2
+                continue
+            if a == "--harness" and i + 1 < len(argv):
+                harness = argv[i + 1]
+                i += 2
+                continue
+            if a == "--json":
+                as_json = True
+                i += 1
+                continue
+            rest.append(a)
+            i += 1
+        policy = checks.load_policy(harness)
+        if cmd == "policy":
+            print("role=%s commit=%s disabled=%s exceptions=%d data-guard=%s" % (
+                checks.current_role(harness), policy.commit, ",".join(policy.disabled) or "-",
+                len(policy.exceptions), checks.find_dataguard(policy) or "not installed"))
+            return 0
+        command = " ".join(rest) if rest else sys.stdin.read()
+        try:
+            d = checks.decide(command, cwd, policy)
+        except Exception as e:
+            d = checks.Decision("deny", "internal error while checking the command (%s). Refused." % e, "guard")
+        if as_json:
+            print(json.dumps({"decision": d.decision, "reason": d.reason, "check": d.check}))
+            return 0
+        if d.decision != "allow":
+            print("kit-guard (%s): %s" % (d.check, d.reason), file=sys.stderr)
+        return {"allow": 0, "deny": 2, "ask": 3}[d.decision]
+    print("kit-guard: unknown command %r (check, hook, post, redact, policy)" % cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,11 @@
+# Harness table for agent-spawn. Copy to ~/.config/work-kit/harnesses.conf and edit.
+# Format: name = shell command. Lines here override the built-in table (claude, codex, gemini,
+# opencode, aider, copilot). The command runs inside the worker's pane, in the working directory.
+# Available variables: "$AGENT_PROMPT" (short instruction that names the task and result files),
+# "$AGENT_PROMPT_FILE", "$AGENT_TASK_FILE", "$AGENT_RESULT_FILE", "$AGENT_NAME", "$AGENT_MODEL".
+#
+# Examples:
+# claude   = claude --model sonnet "$AGENT_PROMPT"
+# codex    = codex --sandbox workspace-write "$AGENT_PROMPT"
+# local    = ollama run llama3 "$(cat "$AGENT_TASK_FILE")"
+# my-tool  = my-agent-cli --task-file "$AGENT_TASK_FILE" --output "$AGENT_RESULT_FILE"

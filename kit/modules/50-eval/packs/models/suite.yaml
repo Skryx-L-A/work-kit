@@ -1,0 +1,148 @@
+# Model comparison: small German and English work tasks with deterministic graders.
+# Same cases, same settings for every candidate. Run through run.sh, or directly:
+#   KIT_LLM_BASE_URL=http://127.0.0.1:8080/v1 EVAL_MODEL=qwen3.5-4b evalkit run suite.yaml -p local -n 3
+# Add cloud candidates to a copy of this file (type: openai, api_key_env: NAME). Only synthetic
+# data is in the cases; keep it that way when you add cases for an external provider.
+name: model-comparison
+description: German and English extraction, classification, summary, translation, reasoning, code and grounding tasks.
+repetitions: 1
+timeout: 300
+
+providers:
+  - id: local                      # kit-llm or any OpenAI-compatible endpoint
+    type: openai
+    base_url: ${KIT_LLM_BASE_URL:-http://127.0.0.1:8080/v1}
+    model: ${EVAL_MODEL:-local}
+    temperature: 0
+    max_tokens: 512
+  - id: fake                       # offline pipeline check, no model
+    type: shell
+    default: false
+    command: "{python} ../lib/fake_reply.py fake-answers.json"
+  - id: fake-bad                   # must score near 0: proves the graders reject wrong answers
+    type: shell
+    default: false
+    command: "{python} ../lib/fake_reply.py fake-answers.json --bad"
+  # - id: company-gateway          # example cloud candidate; key only via environment
+  #   type: openai
+  #   base_url: ${GATEWAY_URL}
+  #   model: gpt-4.1-mini
+  #   api_key_env: GATEWAY_API_KEY
+  #   temperature: 0
+  #   default: false
+
+cases:
+  - id: de-invoice-json
+    input: |
+      Extrahiere aus dem Text die Rechnungsnummer, den Gesamtbetrag in Euro als Zahl und das
+      Rechnungsdatum im Format JJJJ-MM-TT. Antworte nur mit JSON mit den Schlüsseln
+      invoice_number, total_eur und date.
+
+      Text: Sehr geehrte Damen und Herren, anbei erhalten Sie die Rechnung Nr. RE-2026-0412 vom
+      14.08.2026 über insgesamt 1.284,50 EUR (inkl. 19 % MwSt.). Zahlbar bis 13.09.2026.
+    graders:
+      - type: json-schema
+        schema:
+          type: object
+          required: [invoice_number, total_eur, date]
+      - {type: script, command: "{python} checks.py json-fields invoice_number=RE-2026-0412 total_eur=1284.5 date=2026-08-14"}
+
+  - id: en-ticket-classify
+    input: |
+      Classify the support ticket into exactly one of: billing, bug, feature_request, account.
+      Reply with the label only.
+
+      Ticket: Since yesterday's update the export button crashes the app when the list has more than 500 rows.
+    graders:
+      - {type: regex, pattern: "^\\W*bug\\W*$", flags: i}
+
+  - id: de-sentiment
+    input: |
+      Bewerte die Stimmung der Rückmeldung mit genau einem Wort: positiv, neutral oder negativ.
+
+      Rückmeldung: Der Support hat mein Problem innerhalb einer Stunde gelöst, vielen Dank für die schnelle Hilfe!
+    graders:
+      - {type: regex, pattern: "^\\W*positiv\\W*$", flags: i}
+
+  - id: de-email-summary
+    input: |
+      Fasse die E-Mail in höchstens zwei Sätzen auf Deutsch zusammen.
+
+      Hallo Team, das Review-Meeting zur Datenbankmigration wird von Dienstag auf Donnerstag, 14 Uhr,
+      verschoben, weil der Kunde erst dann die Testdaten liefert. Bitte bringt eure offenen Punkte mit.
+      Der Ort bleibt Raum B. Viele Grüße, Jana
+    graders:
+      - {type: contains, value: ["Donnerstag", "14"]}
+      - {type: script, command: "{python} checks.py max-words 45"}
+
+  - id: en-de-translate
+    input: "Translate into German. Reply with the translation only: The backup failed because the disk was full."
+    graders:
+      - {type: contains, value: ["Sicherung", "Backup"], mode: any, ignore_case: true}
+      - {type: contains, value: "voll", ignore_case: true}
+
+  - id: de-en-translate
+    input: "Übersetze ins Englische und antworte nur mit der Übersetzung: Bitte prüfen Sie die Konfiguration, bevor Sie den Dienst neu starten."
+    graders:
+      - {type: contains, value: ["configuration", "before", "restart"], ignore_case: true}
+
+  - id: de-math
+    input: |
+      Ein Team migriert 12 Module pro Woche. Wie viele Wochen braucht es für 90 Module, wenn jede
+      angefangene Woche voll zählt? Antworte nur mit der Zahl.
+    graders:
+      - {type: numeric, expected: 8, pick: last}
+
+  - id: en-code-explain
+    input: |
+      What does this Python function return for n=5? Reply with the number only.
+
+      def f(n):
+          return sum(i * i for i in range(n))
+    graders:
+      - {type: numeric, expected: 30, pick: last}
+
+  - id: en-bullets
+    input: |
+      List exactly three risks of migrating a COBOL batch system to Java. Use exactly three lines,
+      each starting with "- ", and nothing else.
+    graders:
+      - {type: script, command: "{python} checks.py bullets 3"}
+
+  - id: en-code-python
+    input: |
+      Write a Python function slugify(text: str) -> str that lowercases the text, replaces every run
+      of characters that are not ASCII letters or digits with a single hyphen, and strips leading
+      and trailing hyphens. Reply with only the code in one python code block.
+    graders:
+      - {type: script, command: "{python} checks.py python-slugify"}
+
+  - id: en-sql
+    input: |
+      A SQLite table named orders has the columns id INTEGER, customer TEXT, amount REAL and
+      status TEXT. Write one query that returns every customer with the total amount of their
+      orders whose status is 'paid', highest total first. Output columns: customer, total.
+      Reply with only the SQL.
+    graders:
+      - {type: script, command: "{python} checks.py sql"}
+
+  - id: de-grounded-unknown
+    input: |
+      Beantworte die Frage nur anhand des Textes. Wenn die Antwort nicht im Text steht, antworte
+      genau: NICHT IM TEXT
+
+      Text: Die Blumwerk GmbH wurde 2004 in Kassel gegründet und hat 80 Mitarbeitende.
+      Frage: Wie heißt die Geschäftsführerin der Blumwerk GmbH?
+    graders:
+      - {type: contains, value: "NICHT IM TEXT"}
+
+  - id: de-grounded-known
+    input: |
+      Beantworte die Frage nur anhand des Textes. Wenn die Antwort nicht im Text steht, antworte
+      genau: NICHT IM TEXT
+
+      Text: Die Blumwerk GmbH wurde 2004 in Kassel gegründet und hat 80 Mitarbeitende.
+      Frage: In welcher Stadt wurde die Blumwerk GmbH gegründet?
+    graders:
+      - {type: contains, value: "Kassel"}
+      - {type: contains, value: "NICHT IM TEXT", negate: true}

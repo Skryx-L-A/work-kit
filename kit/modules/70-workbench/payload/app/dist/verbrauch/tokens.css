@@ -1,0 +1,141 @@
+/* ERZEUGT von build.mjs aus main/thema.ts (rollenCss()). Nicht von Hand aendern --
+   die Quelle ist main/thema.ts, ROLLEN. */
+:root {
+  color-scheme: dark;
+    --fenster: #0b0d10;
+    --grund: #101216;
+    --leiste: #171a20;
+    --erhoben: #1e232b;
+    --linie: #262b34;
+    --schrift: #d8dee9;
+    --gedaempft: #8b93a1;
+    --wahl: #222833;
+    --tinte: #05070a;
+    --fern: #6a7fd0;
+    --laeuft: #46a758;
+    --will: #e0a020;
+    --aus: #d85858;
+    --vorsichtgrund: #1a1315;
+    --akzent: #0070e0;
+    --akzent-tinte: #ffffff;
+    --akzent-text: #3398ff;
+    --zustand-laeuft: #4ea1ff;
+    --zustand-laeuft-tinte: #05070a;
+    --zustand-wartet: #e0a33e;
+    --zustand-wartet-tinte: #05070a;
+    --zustand-fertig: #3fa66a;
+    --zustand-fertig-tinte: #05070a;
+    --zustand-tot: #cd7979;
+    --zustand-tot-tinte: #05070a;
+    --term-black: #2e3436;
+    --term-red: #cc0000;
+    --term-green: #4e9a06;
+    --term-yellow: #c4a000;
+    --term-blue: #3465a4;
+    --term-magenta: #75507b;
+    --term-cyan: #06989a;
+    --term-white: #d3d7cf;
+    --term-brightBlack: #555753;
+    --term-brightRed: #ef2929;
+    --term-brightGreen: #8ae234;
+    --term-brightYellow: #fce94f;
+    --term-brightBlue: #729fcf;
+    --term-brightMagenta: #ad7fa8;
+    --term-brightCyan: #34e2e2;
+    --term-brightWhite: #eeeeec;
+}
+:root[data-thema='hell'] {
+  color-scheme: light;
+    --fenster: #dfe2e7;
+    --grund: #ffffff;
+    --leiste: #f4f5f7;
+    --erhoben: #eceef2;
+    --linie: #d8dbe1;
+    --schrift: #1b1f27;
+    --gedaempft: #5c6472;
+    --wahl: #e4e8f4;
+    --tinte: #ffffff;
+    --fern: #3355c4;
+    --laeuft: #22803c;
+    --will: #9a6600;
+    --aus: #b3261e;
+    --vorsichtgrund: #fdf2f1;
+    --akzent: #0070eb;
+    --akzent-tinte: #ffffff;
+    --akzent-text: #005dc2;
+    --zustand-laeuft: #0063d3;
+    --zustand-laeuft-tinte: #ffffff;
+    --zustand-wartet: #8d6017;
+    --zustand-wartet-tinte: #ffffff;
+    --zustand-fertig: #2e7a4e;
+    --zustand-fertig-tinte: #ffffff;
+    --zustand-tot: #b24242;
+    --zustand-tot-tinte: #ffffff;
+    --term-black: #2e3436;
+    --term-red: #cc0000;
+    --term-green: #3a7304;
+    --term-yellow: #725d00;
+    --term-blue: #3465a4;
+    --term-magenta: #75507b;
+    --term-cyan: #047173;
+    --term-white: #626861;
+    --term-brightBlack: #555753;
+    --term-brightRed: #cc0f0f;
+    --term-brightGreen: #437611;
+    --term-brightYellow: #695d02;
+    --term-brightBlue: #386ca3;
+    --term-brightMagenta: #855580;
+    --term-brightCyan: #117676;
+    --term-brightWhite: #1b1f27;
+}
+/* Nur das Einstellungsfenster traegt 'system' je als LITERALEN Attributwert
+   (main/einstellungen.ts loest ihn NICHT auf, siehe dessen Kopf) -- die
+   anderen vier Fenster bekommen von main/thema.ts immer schon 'hell' oder
+   'dunkel' und treffen diese Regel nie. Harmlos hier zu tragen, statt ein
+   sechstes Mal dieselben Werte in einstellungen/index.html zu wiederholen. */
+@media (prefers-color-scheme: light) {
+  :root[data-thema='system'] {
+    color-scheme: light;
+    --fenster: #dfe2e7;
+    --grund: #ffffff;
+    --leiste: #f4f5f7;
+    --erhoben: #eceef2;
+    --linie: #d8dbe1;
+    --schrift: #1b1f27;
+    --gedaempft: #5c6472;
+    --wahl: #e4e8f4;
+    --tinte: #ffffff;
+    --fern: #3355c4;
+    --laeuft: #22803c;
+    --will: #9a6600;
+    --aus: #b3261e;
+    --vorsichtgrund: #fdf2f1;
+    --akzent: #0070eb;
+    --akzent-tinte: #ffffff;
+    --akzent-text: #005dc2;
+    --zustand-laeuft: #0063d3;
+    --zustand-laeuft-tinte: #ffffff;
+    --zustand-wartet: #8d6017;
+    --zustand-wartet-tinte: #ffffff;
+    --zustand-fertig: #2e7a4e;
+    --zustand-fertig-tinte: #ffffff;
+    --zustand-tot: #b24242;
+    --zustand-tot-tinte: #ffffff;
+    --term-black: #2e3436;
+    --term-red: #cc0000;
+    --term-green: #3a7304;
+    --term-yellow: #725d00;
+    --term-blue: #3465a4;
+    --term-magenta: #75507b;
+    --term-cyan: #047173;
+    --term-white: #626861;
+    --term-brightBlack: #555753;
+    --term-brightRed: #cc0f0f;
+    --term-brightGreen: #437611;
+    --term-brightYellow: #695d02;
+    --term-brightBlue: #386ca3;
+    --term-brightMagenta: #855580;
+    --term-brightCyan: #117676;
+    --term-brightWhite: #1b1f27;
+  }
+}

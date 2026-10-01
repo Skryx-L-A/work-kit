@@ -1,0 +1,24 @@
+# NICHT INSTALLIERT: Bau-Schritt 2 des Agents-Features (Auftrag traeger); ausgerollt
+# wird vom Orchestrator. Gegenstueck zu ../agent-workbench.wb-traeger.plist.
+#
+# Anmeldestart des Traegers ohne Timer (docs/AGENTS-PLAN.md, Anhang "Traeger"): die
+# Unit laeuft einmal nach dem Start der Nutzerinstanz, wegen Lingering also auch nach
+# einem Neustart ohne Anmeldung. `nachsehen --vordergrund` endet sofort, wenn nichts
+# ansteht; sonst traegt die Unit den Traeger, bis die letzte Aufgabe fertig ist.
+[Unit]
+Description=wb-traeger: Anmeldestart des Traegers (endet sofort, wenn nichts ansteht)
+
+[Service]
+# Type=exec statt oneshot: ein oneshot gilt erst nach dem Ende von ExecStart als
+# gestartet, und default.target stuende so lange der Traeger lebt auf "activating"
+# (Targets ordnen ihre Wants= automatisch mit After=).
+Type=exec
+ExecStart=%h/.local/bin/wb-traeger nachsehen --vordergrund
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Die Hauptagenten laufen in einem tmux-Server, den der Traeger unter Umstaenden
+# selbst anstoesst und der damit in der cgroup dieser Unit liegt. Mit der Vorgabe
+# control-group wuerde das Ende des Traegers jeden laufenden Hauptagenten mitnehmen.
+KillMode=process
+
+[Install]
+WantedBy=default.target

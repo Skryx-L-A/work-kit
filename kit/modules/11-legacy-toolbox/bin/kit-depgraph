@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""kit-depgraph: dependency graph of a source tree as Graphviz DOT, D2 or TSV.
+
+Usage: kit-depgraph [PATH] [--format dot|d2|tsv] [--level dir|file] [--depth N]
+                    [--external] [--exclude GLOB]... [--lang LANG[,LANG]] [-o FILE]
+
+Reads import / include / using / COPY statements and links them to files of the
+scanned tree. Languages: java, csharp, c (C and C++), python, js (JavaScript and
+TypeScript), cobol. Standard library only, no network, read-only.
+
+This is a static approximation. It sees explicit imports, not reflection, dependency
+injection, build-system wiring, or references inside the same Java package / C# namespace
+that need no import. Treat the graph as evidence to check, not as ground truth.
+Cycles (strongly connected components) are highlighted and listed on stderr.
+"""
+import argparse
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "target", "build", "dist", "out", "bin",
+             "obj", "__pycache__", ".venv", "venv", ".tox", ".idea", ".vscode", "vendor",
+             "packages", ".gradle", ".mypy_cache"}
+LANG_EXT = {
+    "java": {".java"},
+    "csharp": {".cs"},
+    "c": {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inl"},
+    "python": {".py"},
+    "js": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"},
+    "cobol": {".cbl", ".cob", ".cobol", ".cpy", ".copy", ".pco"},
+}
+EXT_LANG = {e: l for l, exts in LANG_EXT.items() for e in exts}
+MAX_BYTES = 2_000_000
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(MAX_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def strip_c_comments(text):
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"(?m)//[^\n]*", "", text)
+
+
+def list_files(root, excludes):
+    rels = []
+    if os.path.isdir(os.path.join(root, ".git")):
+        try:
+            out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True,
+                                 check=True).stdout.decode("utf-8", "replace")
+            rels = [p for p in out.split("\0") if p]
+        except (OSError, subprocess.CalledProcessError):
+            rels = []
+    if not rels:
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d not in SKIP_DIRS)
+            for fn in sorted(fns):
+                rels.append(os.path.relpath(os.path.join(dp, fn), root))
+    keep = []
+    for r in rels:
+        parts = r.split("/")
+        if any(p in SKIP_DIRS for p in parts[:-1]):
+            continue
+        if any(fnmatch.fnmatch(r, g) or fnmatch.fnmatch(parts[-1], g) for g in excludes):
+            continue
+        if os.path.splitext(r)[1].lower() in EXT_LANG and os.path.isfile(os.path.join(root, r)):
+            keep.append(r)
+    return sorted(keep)
+
+
+class Graph:
+    def __init__(self):
+        self.edges = defaultdict(int)      # (src, dst) -> count, both are node ids
+        self.external = set()
+
+    def add(self, src, dst):
+        if src != dst:
+            self.edges[(src, dst)] += 1
+
+
+class Scanner:
+    def __init__(self, root, files, langs):
+        self.root = root
+        self.files = files
+        self.langs = langs
+        self.fileset = set(files)
+        self.by_base = defaultdict(list)
+        for f in files:
+            self.by_base[os.path.basename(f)].append(f)
+        self.java_fqn = {}
+        self.java_pkg = defaultdict(list)
+        self.cs_ns = defaultdict(list)
+        self.py_mod = defaultdict(list)
+        self.cobol_stem = defaultdict(list)
+        self.text = {}
+        for f in files:
+            lang = EXT_LANG[os.path.splitext(f)[1].lower()]
+            if lang not in langs:
+                continue
+            t = read_text(os.path.join(root, f))
+            self.text[f] = t
+            self._index(f, lang, t)
+
+    def _index(self, f, lang, text):
+        stem = os.path.splitext(os.path.basename(f))[0]
+        if lang == "java":
+            m = re.search(r"(?m)^\s*package\s+([\w.]+)\s*;", text)
+            pkg = m.group(1) if m else ""
+            self.java_pkg[pkg].append(f)
+            self.java_fqn[(pkg + "." if pkg else "") + stem] = f
+        elif lang == "csharp":
+            for ns in set(re.findall(r"(?m)^\s*namespace\s+([\w.]+)", strip_c_comments(text))):
+                self.cs_ns[ns].append(f)
+        elif lang == "python":
+            parts = os.path.splitext(f)[0].split("/")
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            for i in range(len(parts)):
+                self.py_mod[".".join(parts[i:])].append(f)
+        elif lang == "cobol":
+            self.cobol_stem[stem.lower()].append(f)
+
+    @staticmethod
+    def nearest(src, candidates):
+        def shared(c):
+            a, b = src.split("/")[:-1], c.split("/")[:-1]
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return (-n, len(c), c)
+        return sorted(candidates, key=shared)[0] if candidates else None
+
+    def deps(self, f):
+        """Yield (target_file or None, external_label or None) for every reference in f."""
+        lang = EXT_LANG[os.path.splitext(f)[1].lower()]
+        text = self.text[f]
+        return getattr(self, "_" + lang)(f, text)
+
+    def _java(self, f, text):
+        text = strip_c_comments(text)
+        for m in re.finditer(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+?)(\.\*)?\s*;", text):
+            name, wild = m.group(1), bool(m.group(2))
+            if wild:
+                files = self.java_pkg.get(name)
+                if files:
+                    yield from ((t, None) for t in files)
+                    continue
+                cls = self.java_fqn.get(name)          # import static a.B.*;
+                if cls:
+                    yield cls, None
+                    continue
+            else:
+                parts = name.split(".")
+                for i in range(len(parts), 0, -1):
+                    t = self.java_fqn.get(".".join(parts[:i]))
+                    if t:
+                        yield t, None
+                        break
+                else:
+                    yield None, ".".join(parts[:2]) if len(parts) > 2 else name
+                continue
+            yield None, ".".join(name.split(".")[:2])
+
+    def _csharp(self, f, text):
+        text = strip_c_comments(text)
+        for m in re.finditer(r"(?m)^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;", text):
+            ns = m.group(1)
+            parts = ns.split(".")
+            for i in range(len(parts), 0, -1):
+                files = self.cs_ns.get(".".join(parts[:i]))
+                if files:
+                    yield from ((t, None) for t in files)
+                    break
+            else:
+                yield None, ".".join(parts[:2])
+
+    def _c(self, f, text):
+        text = strip_c_comments(text)
+        for m in re.finditer(r'(?m)^\s*#\s*include\s*([<"])([^>"]+)[>"]', text):
+            kind, inc = m.group(1), os.path.normpath(m.group(2)).replace(os.sep, "/")
+            cand = []
+            if kind == '"':
+                rel = os.path.normpath(os.path.join(os.path.dirname(f), inc)).replace(os.sep, "/")
+                if rel in self.fileset:
+                    cand = [rel]
+            if not cand:
+                cand = [p for p in self.by_base.get(os.path.basename(inc), [])
+                        if p == inc or p.endswith("/" + inc)]
+            t = self.nearest(f, cand)
+            if t:
+                yield t, None
+            else:
+                yield None, "<%s>" % inc if kind == "<" else '"%s"' % inc
+
+    def _python(self, f, text):
+        pkg = f.split("/")[:-1]
+        for m in re.finditer(r"(?m)^[ \t]*(?:from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+([^\n#]+)|import[ \t]+([\w., \t]+))", text):
+            if m.group(4) is not None:
+                names = [n.strip().split(" as ")[0].strip() for n in m.group(4).split(",")]
+                for n in names:
+                    yield from self._py_resolve(f, n, [])
+                continue
+            dots, mod, what = m.group(1), m.group(2), m.group(3)
+            what = what.replace("(", " ").replace(")", " ")
+            items = [w.strip().split(" as ")[0].strip() for w in what.split(",")]
+            items = [i for i in items if i and i != "\\" and re.match(r"^\w+$|^\*$", i)]
+            if dots:
+                base = pkg[:len(pkg) - (len(dots) - 1)] if len(dots) > 1 else pkg
+                full = ".".join(base + ([mod] if mod else []))
+                yield from self._py_resolve(f, full, items, absolute=True, prefer=base)
+            else:
+                yield from self._py_resolve(f, mod, items)
+
+    def _py_resolve(self, f, mod, items, absolute=False, prefer=None):
+        found = False
+        for it in items:
+            t = self.nearest(f, self.py_mod.get(mod + "." + it if mod else it, []))
+            if t and t != f:
+                found = True
+                yield t, None
+        if found:
+            return
+        parts = mod.split(".") if mod else []
+        for i in range(len(parts), 0, -1):
+            t = self.nearest(f, self.py_mod.get(".".join(parts[:i]), []))
+            if t:
+                yield t, None
+                return
+        if parts and not absolute and parts[0] not in ("__future__",):
+            yield None, parts[0]
+
+    _JS_PATTERNS = [
+        re.compile(r"""(?:import|export)\s[^'"`;]*?\sfrom\s*['"]([^'"]+)['"]"""),
+        re.compile(r"""(?m)^\s*import\s*['"]([^'"]+)['"]"""),
+        re.compile(r"""\brequire\(\s*['"]([^'"]+)['"]\s*\)"""),
+        re.compile(r"""\bimport\(\s*['"]([^'"]+)['"]\s*\)"""),
+    ]
+    _JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".d.ts"]
+
+    def _js(self, f, text):
+        text = strip_c_comments(text)
+        seen = set()
+        for pat in self._JS_PATTERNS:
+            for m in pat.finditer(text):
+                spec = m.group(1)
+                if spec in seen:
+                    continue
+                seen.add(spec)
+                if not spec.startswith("."):
+                    parts = spec.split("/")
+                    pkg = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+                    yield None, pkg
+                    continue
+                base = os.path.normpath(os.path.join(os.path.dirname(f), spec)).replace(os.sep, "/")
+                cands = [base] + [base + e for e in self._JS_EXTS] + [base + "/index" + e for e in self._JS_EXTS]
+                stem = re.sub(r"\.(js|jsx|mjs|cjs)$", "", base)      # TS imports written with .js
+                cands += [stem + e for e in self._JS_EXTS if stem != base]
+                for c in cands:
+                    if c in self.fileset:
+                        yield c, None
+                        break
+
+    def _cobol(self, f, text):
+        lines = []
+        for ln in text.splitlines():
+            if ln[6:7] in ("*", "/") or ln.lstrip().startswith("*>"):
+                continue
+            lines.append(re.sub(r"\*>.*$", "", ln))
+        text = "\n".join(lines)
+        names = [(n, "copy") for n in re.findall(r"(?i)\bCOPY\s+['\"]?([A-Z0-9_-]+)", text)]
+        names += [(n, "call") for n in re.findall(r"""(?i)\bCALL\s+['"]([A-Z0-9_-]+)['"]""", text)]
+        for n, kind in names:
+            t = self.nearest(f, self.cobol_stem.get(n.lower(), []))
+            if t:
+                yield t, None
+            else:
+                yield None, n.upper() + (" (copybook)" if kind == "copy" else " (program)")
+
+
+def node_id(path, level, depth):
+    if level == "file":
+        return path
+    d = path.split("/")[:-1]
+    if depth:
+        d = d[:depth]
+    return "/".join(d) or "."
+
+
+def build(root, args):
+    langs = set(args.lang.split(",")) if args.lang != "auto" else set(LANG_EXT)
+    unknown = langs - set(LANG_EXT)
+    if unknown:
+        sys.exit("kit-depgraph: unknown language: %s (use %s)" % (",".join(sorted(unknown)), ",".join(LANG_EXT)))
+    files = [f for f in list_files(root, args.exclude) if EXT_LANG[os.path.splitext(f)[1].lower()] in langs]
+    sc = Scanner(root, files, langs)
+    g = Graph()
+    for f in files:
+        src = node_id(f, args.level, args.depth)
+        for target, ext in sc.deps(f):
+            if target:
+                g.add(src, node_id(target, args.level, args.depth))
+            elif ext and args.external:
+                label = "ext: " + ext
+                g.external.add(label)
+                g.add(src, label)
+    return files, g
+
+
+def cycles(nodes, edges):
+    """Strongly connected components with more than one node (iterative Tarjan)."""
+    adj = defaultdict(list)
+    for (a, b) in edges:
+        adj[a].append(b)
+    index, low, on, stack, out, counter = {}, {}, set(), [], [], [0]
+    for start in sorted(nodes):
+        if start in index:
+            continue
+        work = [(start, iter(adj[start]))]
+        index[start] = low[start] = counter[0]; counter[0] += 1
+        stack.append(start); on.add(start)
+        while work:
+            v, it = work[-1]
+            adv = False
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = counter[0]; counter[0] += 1
+                    stack.append(w); on.add(w)
+                    work.append((w, iter(adj[w])))
+                    adv = True
+                    break
+                if w in on:
+                    low[v] = min(low[v], index[w])
+            if adv:
+                continue
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[v])
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop(); on.discard(w); comp.append(w)
+                    if w == v:
+                        break
+                if len(comp) > 1:
+                    out.append(sorted(comp))
+    return out
+
+
+def q_dot(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def q_d2(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render(fmt, nodes, g, cyc_nodes):
+    lines = []
+    if fmt == "tsv":
+        lines.append("from\tto\tcount")
+        for (a, b), n in sorted(g.edges.items()):
+            lines.append("%s\t%s\t%d" % (a, b, n))
+    elif fmt == "dot":
+        lines += ["digraph deps {", "  rankdir=LR;", "  node [shape=box, fontsize=10];"]
+        for n in sorted(nodes):
+            attrs = []
+            if n in cyc_nodes:
+                attrs.append("color=red")
+            if n in g.external:
+                attrs.append("style=dashed")
+            lines.append("  %s%s;" % (q_dot(n), " [%s]" % ", ".join(attrs) if attrs else ""))
+        for (a, b), n in sorted(g.edges.items()):
+            lines.append("  %s -> %s%s;" % (q_dot(a), q_dot(b), ' [label="%d"]' % n if n > 1 else ""))
+        lines.append("}")
+    else:
+        lines.append("direction: right")
+        for n in sorted(nodes):
+            props = []
+            if n in cyc_nodes:
+                props.append("style.stroke: red")
+            if n in g.external:
+                props.append("style.stroke-dash: 3")
+            lines.append("%s%s" % (q_d2(n), ": {%s}" % "; ".join(props) if props else ""))
+        for (a, b), n in sorted(g.edges.items()):
+            lines.append("%s -> %s%s" % (q_d2(a), q_d2(b), ": %d" % n if n > 1 else ""))
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="kit-depgraph", description=__doc__.split("\n\n")[0])
+    ap.add_argument("path", nargs="?", default=".")
+    ap.add_argument("--format", choices=["dot", "d2", "tsv"], default="dot")
+    ap.add_argument("--level", choices=["dir", "file"], default="dir",
+                    help="nodes are directories (default) or files")
+    ap.add_argument("--depth", type=int, default=0, help="dir level: keep only the first N path segments")
+    ap.add_argument("--external", action="store_true", help="add third-party / system dependencies")
+    ap.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                    help="skip paths or file names matching GLOB (repeatable)")
+    ap.add_argument("--lang", default="auto", help="auto or a comma list of: " + ", ".join(LANG_EXT))
+    ap.add_argument("-o", "--output", help="write to FILE instead of stdout")
+    args = ap.parse_args(argv)
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        sys.exit("kit-depgraph: not a directory: %s" % args.path)
+    files, g = build(root, args)
+    nodes = {n for e in g.edges for n in e}
+    for f in files:
+        nodes.add(node_id(f, args.level, args.depth))
+    comps = cycles(nodes, g.edges)
+    cyc_nodes = {n for c in comps for n in c}
+    text = render(args.format, nodes, g, cyc_nodes)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    sys.stderr.write("kit-depgraph: %d files, %d nodes, %d edges, %d cycle group(s)\n"
+                     % (len(files), len(nodes), len(g.edges), len(comps)))
+    for c in sorted(comps, key=len, reverse=True)[:10]:
+        sys.stderr.write("  cycle (%d): %s\n" % (len(c), ", ".join(c[:8]) + (", ..." if len(c) > 8 else "")))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

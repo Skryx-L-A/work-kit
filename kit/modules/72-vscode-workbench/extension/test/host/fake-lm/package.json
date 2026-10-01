@@ -1,0 +1,13 @@
+{
+  "name": "kit-workbench-fake-lm",
+  "displayName": "Kit Workbench test language model",
+  "version": "0.0.1",
+  "publisher": "work-kit-test",
+  "private": true,
+  "engines": { "vscode": "^1.104.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "languageModelChatProviders": [{ "vendor": "kit-test", "displayName": "Kit test model" }]
+  }
+}
